@@ -57,7 +57,7 @@
 
 .NOTES
     Author : Mike Lee
-    Version: 3.0
+    Version: 4.0
 #>
 
 function Start-ScannerInCleanPwshIfNeeded {
@@ -124,11 +124,7 @@ $SPOExportMaxWaitSec = 300  # max seconds to wait for export file
 
 #region Initialization
 $date = Get-Date -Format 'yyyyMMdd_HHmmss'
-$today = (Get-Date).Date
 $script:assemblyConflictHintShown = $false
-
-$global:token = $null
-$global:tokenExpiry = $null
 
 # Ensure output directory exists
 if (-not (Test-Path $OutputFolder)) {
@@ -190,12 +186,8 @@ function Invoke-GraphRequestWithThrottleHandling {
     param (
         [Parameter(Mandatory)] [string]    $Uri,
         [Parameter(Mandatory)] [string]    $Method,
-        [Parameter()]          [hashtable] $Headers = @{},
         [Parameter()]          [string]    $Body = $null,
-        [Parameter()]          [string]    $ContentType = 'application/json',
-        [Parameter()]          [int]       $MaxRetries = $script:MaxRetries,
-        [Parameter()]          [int]       $InitialBackoffSeconds = $script:InitialBackoffSec,
-        [Parameter()]          [int]       $TimeoutSeconds = $script:RequestTimeoutSec
+        [Parameter()]          [string]    $ContentType = 'application/json'
     )
 
     Test-ValidToken
@@ -361,24 +353,6 @@ function Test-ValidToken {
     }
 }
 
-function Get-GraphAuthHeaders {
-    # Authentication is handled automatically by Invoke-MgGraphRequest / Microsoft.Graph SDK.
-    # Retained for call-site compatibility — no manual bearer token required.
-    Test-ValidToken
-    return @{}
-}
-
-function Get-AppTokenForScope {
-    <#
-    .SYNOPSIS
-        Not used in interactive auth mode.  App-only token acquisition requires an
-        Entra ID app registration, which is not configured for interactive auth.
-        Native module auth (Connect-ToPowerBIService / Connect-ToPowerPlatformAdmin)
-        is used instead; REST-only fallbacks for Power Platform are skipped.
-    #>
-    param([Parameter(Mandatory)][string]$Scope)
-    return $null
-}
 
 #endregion Authentication Functions
 
@@ -616,24 +590,7 @@ function Connect-ToSecurityCompliance {
     }
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
-    $connectParams = @{
-        ShowBanner  = $false
-        ErrorAction = 'Stop'
-    }
-    $ippsCommand = Get-Command -Name Connect-IPPSSession -ErrorAction Stop
-    if ($ippsCommand.Parameters.ContainsKey('CommandName')) {
-        $connectParams['CommandName'] = @(
-            'Get-Label',
-            'Get-DlpCompliancePolicy',
-            'Get-DlpComplianceRule',
-            'Get-AdminAuditLogConfig',
-            'Get-UnifiedAuditLogRetentionPolicy',
-            'Get-ProtectionAlert',
-            'Search-UnifiedAuditLog'
-        )
-    }
-
-    Connect-IPPSSession @connectParams
+    Connect-IPPSSession -ShowBanner:$false -ErrorAction Stop
     Write-Log "  Connected to Security & Compliance PowerShell (interactive delegated auth)" 'SUCCESS'
 }
 
@@ -851,6 +808,7 @@ function Collect-SharePointData {
         $null = $activeGeoAdmins.Add($adminUrl)
 
         # Detect multi-geo using SPO module native cmdlets and build GEO admin URL list.
+        $geoCodeMap = @{ $adminUrl = 'PRIMARY' }
         try {
             $geoQuotaRaw = @(Get-SPOGeoStorageQuota -AllLocations -ErrorAction Stop)
             if ($geoQuotaRaw.Count -gt 0) {
@@ -948,20 +906,24 @@ function Collect-SharePointData {
                     }
 
                     # Export per-geo summary
+                    # Export per-geo summary for multi-geo only; single-geo is covered by the
+                    # accurate consolidated SPO_SiteSummary written after Get-SPOTenant runs.
                     if ($geoSiteCount -gt 0) {
-                        $tenantPoolMB = if ($adminUrlsToScan.Count -eq 1) { [double]$spoTenant.StorageQuota } else { [double]$geoUsedMB * 2 }
-                        $perGeoSummary = @([PSCustomObject]@{
-                                TotalSites              = $geoSiteCount
-                                TotalStorageUsedMB      = [math]::Round($geoUsedMB, 2)
-                                TotalStorageUsedGB      = [math]::Round(($geoUsedMB / 1024), 2)
-                                AvgStorageUsedPerSiteMB = if ($geoSiteCount -gt 0) { [math]::Round(($geoUsedMB / $geoSiteCount), 2) } else { 0 }
-                                AvgStorageUsedPerSiteGB = if ($geoSiteCount -gt 0) { [math]::Round((($geoUsedMB / $geoSiteCount) / 1024), 4) } else { 0 }
-                                PercentGeoStorageUsed   = if ($tenantPoolMB -gt 0) { [math]::Round((($geoUsedMB / $tenantPoolMB) * 100), 4) } else { 0 }
-                                GeoAdminUrl             = $geoAdminUrl
-                                CollectDate             = (Get-Date -Format 'yyyy-MM-dd HH:mm')
-                            })
-                        Export-ToCsv -Data $perGeoSummary -FileName "SPO_SiteSummary${geoSuffix}_$date.csv"
                         Write-Log "  GEO scan complete (${geoSuffix}): $geoSiteCount sites | $([math]::Round(($geoUsedMB / 1024), 2)) GB used" 'SUCCESS'
+                        if ($adminUrlsToScan.Count -gt 1) {
+                            $tenantPoolMB = [double]$geoUsedMB * 2
+                            $perGeoSummary = @([PSCustomObject]@{
+                                    TotalSites              = $geoSiteCount
+                                    TotalStorageUsedMB      = [math]::Round($geoUsedMB, 2)
+                                    TotalStorageUsedGB      = [math]::Round(($geoUsedMB / 1024), 2)
+                                    AvgStorageUsedPerSiteMB = if ($geoSiteCount -gt 0) { [math]::Round(($geoUsedMB / $geoSiteCount), 2) } else { 0 }
+                                    AvgStorageUsedPerSiteGB = if ($geoSiteCount -gt 0) { [math]::Round((($geoUsedMB / $geoSiteCount) / 1024), 4) } else { 0 }
+                                    PercentGeoStorageUsed   = if ($tenantPoolMB -gt 0) { [math]::Round((($geoUsedMB / $tenantPoolMB) * 100), 4) } else { 0 }
+                                    GeoAdminUrl             = $geoAdminUrl
+                                    CollectDate             = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+                                })
+                            Export-ToCsv -Data $perGeoSummary -FileName "SPO_SiteSummary${geoSuffix}_$date.csv"
+                        }
                     }
                     else {
                         Write-Log "  GEO scan (${geoSuffix}): no sites found." 'DEBUG'
@@ -2226,10 +2188,9 @@ function Collect-EntraIDData {
     # --- Auth methods registration summary ---
     try {
         Write-Log "  Authentication method registration summary..."
-        $headers = Get-GraphAuthHeaders
         $authReg = Invoke-GraphRequestWithThrottleHandling `
             -Uri 'https://graph.microsoft.com/v1.0/reports/authenticationMethods/usersRegisteredByFeature' `
-            -Method 'GET' -Headers $headers
+            -Method 'GET'
         if ($authReg.userRegistrationFeatureCounts) {
             $authData = foreach ($item in $authReg.userRegistrationFeatureCounts) {
                 [PSCustomObject]@{
@@ -2292,6 +2253,59 @@ function Invoke-GraphPagedRequestWithFallback {
     throw "No $Description endpoint returned data."
 }
 
+function Invoke-GraphBatchGetRequests {
+    param(
+        [Parameter(Mandatory)] [object[]] $Requests,
+        [Parameter(Mandatory)] [string] $Description
+    )
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ($Requests.Count -eq 0) { return @($results) }
+
+    for ($offset = 0; $offset -lt $Requests.Count; $offset += 20) {
+        $chunkEnd = [Math]::Min($offset + 19, $Requests.Count - 1)
+        $chunk = @($Requests[$offset..$chunkEnd])
+        $batchBody = @{
+            requests = @($chunk | ForEach-Object {
+                    @{
+                        id     = [string]$_.Id
+                        method = 'GET'
+                        url    = $_.Url
+                    }
+                })
+        } | ConvertTo-Json -Depth 6
+
+        try {
+            $batchResponse = Invoke-GraphRequestWithThrottleHandling -Uri 'https://graph.microsoft.com/v1.0/$batch' -Method 'POST' -Body $batchBody
+            foreach ($response in @($batchResponse.responses)) {
+                $sourceRequest = $chunk | Where-Object { [string]$_.Id -eq [string]$response.id } | Select-Object -First 1
+                $items = if ($response.body.value) { @($response.body.value) } else { @() }
+                $results.Add([PSCustomObject]@{
+                        Id      = $response.id
+                        Status  = [int]$response.status
+                        Items   = $items
+                        Body    = $response.body
+                        Context = $sourceRequest.Context
+                    })
+            }
+        }
+        catch {
+            Write-Log "    Graph batch failed for $Description chunk starting at ${offset}: $($_.Exception.Message)" 'WARN'
+            foreach ($request in $chunk) {
+                $results.Add([PSCustomObject]@{
+                        Id      = $request.Id
+                        Status  = 0
+                        Items   = @()
+                        Body    = $null
+                        Context = $request.Context
+                    })
+            }
+        }
+    }
+
+    return @($results)
+}
+
 function Collect-PurviewDlpPolicies {
     try {
         Write-Log "  Purview DLP policies..."
@@ -2343,9 +2357,9 @@ function Collect-PurviewDlpPolicies {
 }
 
 function Collect-PurviewAuditConfigAndChangeEvents {
-    try {
-        Write-Log "  Purview audit configuration..."
+    Write-Log "  Purview audit configuration..."
 
+    try {
         if (Get-Command -Name Get-AdminAuditLogConfig -ErrorAction SilentlyContinue) {
             $auditConfig = Get-AdminAuditLogConfig -ErrorAction Stop
             Export-ToCsv -Data @(ConvertTo-FlatCsvRow -InputObject $auditConfig) -FileName "Purview_AuditConfig_$date.csv"
@@ -2353,7 +2367,13 @@ function Collect-PurviewAuditConfigAndChangeEvents {
         else {
             Write-Log "  Get-AdminAuditLogConfig is unavailable in this session." 'WARN'
         }
+    }
+    catch {
+        Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'AdminAuditLogConfig' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "Purview_AuditConfig_$date.csv"
+        Write-Log "  Purview audit config unavailable: $($_.Exception.Message)" 'WARN'
+    }
 
+    try {
         if (Get-Command -Name Get-UnifiedAuditLogRetentionPolicy -ErrorAction SilentlyContinue) {
             $retentionPolicies = @(Get-UnifiedAuditLogRetentionPolicy -ErrorAction Stop)
             $retentionRows = @(foreach ($policy in $retentionPolicies) { ConvertTo-FlatCsvRow -InputObject $policy })
@@ -2365,7 +2385,13 @@ function Collect-PurviewAuditConfigAndChangeEvents {
         else {
             Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'UnifiedAuditLogRetentionPolicy' -Status 'CmdletUnavailable' -Note 'Get-UnifiedAuditLogRetentionPolicy is unavailable in this session.') -FileName "Purview_AuditRetentionPolicies_$date.csv"
         }
+    }
+    catch {
+        Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'UnifiedAuditLogRetentionPolicy' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "Purview_AuditRetentionPolicies_$date.csv"
+        Write-Log "  Purview audit retention policies unavailable: $($_.Exception.Message)" 'WARN'
+    }
 
+    try {
         if (Get-Command -Name Get-ProtectionAlert -ErrorAction SilentlyContinue) {
             $alerts = @(Get-ProtectionAlert -ErrorAction Stop)
             $alertRows = @(foreach ($alert in $alerts) { ConvertTo-FlatCsvRow -InputObject $alert })
@@ -2377,7 +2403,13 @@ function Collect-PurviewAuditConfigAndChangeEvents {
         else {
             Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'ProtectionAlert' -Status 'CmdletUnavailable' -Note 'Get-ProtectionAlert is unavailable in this session.') -FileName "Purview_AlertPolicies_$date.csv"
         }
+    }
+    catch {
+        Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'ProtectionAlert' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "Purview_AlertPolicies_$date.csv"
+        Write-Log "  Purview alert policies unavailable: $($_.Exception.Message)" 'WARN'
+    }
 
+    try {
         if (Get-Command -Name Search-UnifiedAuditLog -ErrorAction SilentlyContinue) {
             $startDate = (Get-Date).AddDays(-30)
             $endDate = Get-Date
@@ -2403,7 +2435,7 @@ function Collect-PurviewAuditConfigAndChangeEvents {
                     try { $auditData = $event.AuditData | ConvertFrom-Json -ErrorAction Stop } catch {}
                     [PSCustomObject]@{
                         CreationDate = $event.CreationDate
-                        Operation    = $event.Operations
+                        Operation    = $event.Operation
                         Workload     = $event.Workload
                         UserIds      = $event.UserIds
                         ObjectId     = if ($auditData) { $auditData.ObjectId } else { '' }
@@ -2437,7 +2469,9 @@ function Collect-PurviewAuditConfigAndChangeEvents {
         }
     }
     catch {
-        Write-Log "  Purview audit configuration/change telemetry unavailable: $($_.Exception.Message)" 'WARN'
+        Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'UnifiedAuditLogChangeEvent' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "Purview_AuditChangeEvents_$date.csv"
+        Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'CopilotAuditEvents' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "Purview_CopilotAuditEvents_$date.csv"
+        Write-Log "  Purview audit change-event telemetry unavailable: $($_.Exception.Message)" 'WARN'
     }
 }
 
@@ -2581,26 +2615,34 @@ function Collect-EntraAppConsents {
         Export-ToCsv -Data $delegatedRows -FileName "EntraID_OAuth2PermissionGrants_$date.csv"
 
         $appRoleRows = [System.Collections.Generic.List[object]]::new()
-        foreach ($sp in $servicePrincipals) {
-            try {
-                $assignments = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($sp.id)/appRoleAssignments?`$top=999"
-                foreach ($assignment in $assignments) {
-                    $resource = $servicePrincipalById[$assignment.resourceId]
-                    $appRoleRows.Add([PSCustomObject]@{
-                            GrantType            = 'Application'
-                            ClientId             = $sp.id
-                            ClientApp            = $sp.displayName
-                            ResourceId           = $assignment.resourceId
-                            ResourceApp          = if ($resource) { $resource.displayName } else { $assignment.resourceDisplayName }
-                            AppRoleId            = $assignment.appRoleId
-                            PrincipalDisplayName = $assignment.principalDisplayName
-                            CreatedDateTime      = $assignment.createdDateTime
-                            CollectDate          = (Get-Date -Format 'yyyy-MM-dd HH:mm')
-                        })
+        $appRoleRequests = @($servicePrincipals | ForEach-Object {
+                [PSCustomObject]@{
+                    Id      = $_.id
+                    Url     = "/servicePrincipals/$($_.id)/appRoleAssignments?`$top=999"
+                    Context = $_
                 }
+            })
+        $appRoleResponses = Invoke-GraphBatchGetRequests -Requests $appRoleRequests -Description 'service principal app-role assignments'
+        foreach ($response in $appRoleResponses) {
+            $sp = $response.Context
+            if ($response.Status -lt 200 -or $response.Status -ge 300) {
+                Write-Log "    App-role assignment lookup skipped for $($sp.displayName): HTTP $($response.Status)" 'DEBUG'
+                continue
             }
-            catch {
-                Write-Log "    App-role assignment lookup skipped for $($sp.displayName): $($_.Exception.Message)" 'DEBUG'
+
+            foreach ($assignment in @($response.Items)) {
+                $resource = $servicePrincipalById[$assignment.resourceId]
+                $appRoleRows.Add([PSCustomObject]@{
+                        GrantType            = 'Application'
+                        ClientId             = $sp.id
+                        ClientApp            = $sp.displayName
+                        ResourceId           = $assignment.resourceId
+                        ResourceApp          = if ($resource) { $resource.displayName } else { $assignment.resourceDisplayName }
+                        AppRoleId            = $assignment.appRoleId
+                        PrincipalDisplayName = $assignment.principalDisplayName
+                        CreatedDateTime      = $assignment.createdDateTime
+                        CollectDate          = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+                    })
             }
         }
         Export-ToCsv -Data @($appRoleRows) -FileName "EntraID_AppRoleAssignments_$date.csv"
@@ -2714,23 +2756,38 @@ function Collect-EntraGroupGovernance {
         $groups = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/groups?`$select=id,displayName,mail,groupTypes,createdDateTime&`$top=999"
         $m365Groups = @($groups | Where-Object { $_.groupTypes -contains 'Unified' })
 
-        $ownerRows = foreach ($group in $m365Groups) {
-            $owners = @(Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/groups/$($group.id)/owners?`$select=id,displayName,userPrincipalName&`$top=999")
+        $ownerRequests = @($m365Groups | ForEach-Object {
+                [PSCustomObject]@{
+                    Id      = $_.id
+                    Url     = "/groups/$($_.id)/owners?`$select=id,displayName,userPrincipalName&`$top=999"
+                    Context = $_
+                }
+            })
+        $ownerResponses = Invoke-GraphBatchGetRequests -Requests $ownerRequests -Description 'Microsoft 365 group owners'
+        $ownerLookupFailures = @($ownerResponses | Where-Object { $_.Status -lt 200 -or $_.Status -ge 300 }).Count
+        foreach ($failedResponse in @($ownerResponses | Where-Object { $_.Status -lt 200 -or $_.Status -ge 300 })) {
+            Write-Log "    Owner lookup failed for group $($failedResponse.Context.id): HTTP $($failedResponse.Status)" 'DEBUG'
+        }
+        $ownerRows = foreach ($response in $ownerResponses) {
+            $owners = if ($response.Status -ge 200 -and $response.Status -lt 300) { @($response.Items) } else { $null }
             [PSCustomObject]@{
-                OwnerCount = $owners.Count
+                OwnerCount        = if ($null -eq $owners) { $null } else { $owners.Count }
+                OwnerLookupFailed = ($null -eq $owners)
             }
         }
 
-        $atRiskGroups = @($ownerRows | Where-Object { $_.OwnerCount -le 1 })
-        $zeroOwnerCount = @($ownerRows | Where-Object { $_.OwnerCount -eq 0 }).Count
-        $singleOwnerCount = @($ownerRows | Where-Object { $_.OwnerCount -eq 1 }).Count
+        $ownerRowsWithCounts = @($ownerRows | Where-Object { -not $_.OwnerLookupFailed })
+        $atRiskGroups = @($ownerRowsWithCounts | Where-Object { $_.OwnerCount -le 1 })
+        $zeroOwnerCount = @($ownerRowsWithCounts | Where-Object { $_.OwnerCount -eq 0 }).Count
+        $singleOwnerCount = @($ownerRowsWithCounts | Where-Object { $_.OwnerCount -eq 1 }).Count
         $ownerlessSummary = @([PSCustomObject]@{
                 ObjectType                   = 'Microsoft365Group'
                 TotalMicrosoft365Groups      = $m365Groups.Count
+                GroupsWithOwnerLookupFailure = $ownerLookupFailures
                 GroupsWithZeroOwners         = $zeroOwnerCount
                 GroupsWithOneOwner           = $singleOwnerCount
                 GroupsWithOneOrFewerOwners   = $atRiskGroups.Count
-                PercentWithOneOrFewerOwners  = if ($m365Groups.Count -gt 0) { [math]::Round(($atRiskGroups.Count / $m365Groups.Count) * 100, 2) } else { 0 }
+                PercentWithOneOrFewerOwners  = if ($ownerRowsWithCounts.Count -gt 0) { [math]::Round(($atRiskGroups.Count / $ownerRowsWithCounts.Count) * 100, 2) } else { 0 }
                 MinimumRecommendedOwnerCount = 2
                 CollectDate                  = (Get-Date -Format 'yyyy-MM-dd HH:mm')
             })
@@ -2980,51 +3037,8 @@ function Collect-PowerPlatformData {
     }
     catch {
         Write-Log "  Power BI native module collection unavailable: $($_.Exception.Message)" 'WARN'
-        try {
-            $pbiToken = Get-AppTokenForScope -Scope 'https://analysis.windows.net/powerbi/api/.default'
-            if ([string]::IsNullOrWhiteSpace($pbiToken)) {
-                Write-Log "  Power BI REST fallback skipped: app-only token acquisition is not configured for interactive auth mode." 'WARN'
-                throw 'SkipPbiRestFallback'
-            }
-            $pbiHeader = @{ Authorization = "Bearer $pbiToken" }
-            $pbiWorkspaces = [System.Collections.Generic.List[object]]::new()
-            $pbiNextLink = 'https://api.powerbi.com/v1.0/myorg/admin/groups?$top=5000'
-            do {
-                $pbiResp = Invoke-RestMethod -Uri $pbiNextLink -Method 'GET' `
-                    -Headers $pbiHeader -ErrorAction Stop -Verbose:$false
-                if ($pbiResp.value) { $pbiWorkspaces.AddRange([object[]]$pbiResp.value) }
-                $pbiNextLink = $pbiResp.'@odata.nextLink'
-            } while ($pbiNextLink)
-
-            $pbiWsData = foreach ($ws in $pbiWorkspaces) {
-                [PSCustomObject]@{
-                    Id                    = $ws.id
-                    Name                  = $ws.name
-                    Type                  = $ws.type
-                    State                 = $ws.state
-                    IsOnDedicatedCapacity = $ws.isOnDedicatedCapacity
-                    CapacityId            = $ws.capacityId
-                    CollectDate           = (Get-Date -Format 'yyyy-MM-dd HH:mm')
-                }
-            }
-            Export-ToCsv -Data $pbiWsData -FileName "PowerPlatform_PowerBI_Workspaces_$date.csv"
-            Write-Log "  Power BI workspaces via REST fallback: $($pbiWorkspaces.Count)" 'SUCCESS'
-        }
-        catch {
-            if ($_.Exception.Message -eq 'SkipPbiRestFallback') { }
-            else {
-                $sc = $null
-                if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
-                if ($sc -in @(401, 403)) {
-                    Write-Log "  Power BI workspaces unavailable ($sc — access denied)." 'WARN'
-                    Write-Log "    Ensure your account has 'Power BI Administrator' or 'Global Administrator' role." 'WARN'
-                    Write-Log "    In Power BI Admin portal: Tenant settings -> Allow users to use Power BI APIs." 'WARN'
-                }
-                else {
-                    Write-Log "  Power BI workspaces unavailable: $($_.Exception.Message)" 'WARN'
-                }
-            }
-        }
+        Write-Log "    Ensure your account has 'Power BI Administrator' or 'Global Administrator' role." 'WARN'
+        Write-Log "    In Power BI Admin portal: Tenant settings -> Allow users to use Power BI APIs." 'WARN'
     }
 
     # --- Power BI capacities ---
@@ -3050,31 +3064,7 @@ function Collect-PowerPlatformData {
         }
     }
     catch {
-        try {
-            $pbiToken = Get-AppTokenForScope -Scope 'https://analysis.windows.net/powerbi/api/.default'
-            if ([string]::IsNullOrWhiteSpace($pbiToken)) {
-                Write-Log "  Power BI capacities REST fallback skipped: app-only token acquisition is not configured for interactive auth mode." 'WARN'
-                throw 'SkipPbiCapacityRestFallback'
-            }
-            $pbiHeader = @{ Authorization = "Bearer $pbiToken" }
-            $capResp = Invoke-RestMethod -Uri 'https://api.powerbi.com/v1.0/myorg/admin/capacities' `
-                -Method 'GET' -Headers $pbiHeader -ErrorAction Stop -Verbose:$false
-            if ($capResp.value -and $capResp.value.Count -gt 0) {
-                $capData = foreach ($c in $capResp.value) {
-                    [PSCustomObject]@{
-                        Id          = $c.id
-                        DisplayName = $c.displayName
-                        Sku         = $c.sku
-                        State       = $c.state
-                        Region      = $c.region
-                        CollectDate = (Get-Date -Format 'yyyy-MM-dd HH:mm')
-                    }
-                }
-                Export-ToCsv -Data $capData -FileName "PowerPlatform_PowerBI_Capacities_$date.csv"
-                Write-Log "  Power BI capacities via REST fallback: $($capResp.value.Count)" 'SUCCESS'
-            }
-        }
-        catch { } # advisory already printed by the workspaces block above
+        Write-Log "  Power BI capacities unavailable: $($_.Exception.Message)" 'WARN'
     }
 
     # --- Power Platform environments (isolated first; native + REST fallback) ---
@@ -3139,51 +3129,27 @@ function Collect-PowerPlatformData {
     }
 
     if (-not $envCollected) {
-        try {
-            $ppToken = Get-AppTokenForScope -Scope 'https://service.powerapps.com/.default'
-            if ([string]::IsNullOrWhiteSpace($ppToken)) {
-                Write-Log "  Power Platform REST fallback skipped: app-only token acquisition is not configured for interactive auth mode." 'WARN'
-                throw 'SkipPowerPlatformRestFallback'
-            }
-            $ppHeader = @{ Authorization = "Bearer $ppToken" }
-            $ppResp = Invoke-RestMethod `
-                -Uri 'https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments?api-version=2021-04-01' `
-                -Method 'GET' -Headers $ppHeader -ErrorAction Stop -Verbose:$false
-            $envData = foreach ($env in $ppResp.value) {
-                [PSCustomObject]@{
-                    Name              = $env.name
-                    DisplayName       = $env.properties.displayName
-                    Location          = $env.location
-                    Type              = $env.properties.environmentSku
-                    ProvisioningState = $env.properties.provisioningState
-                    IsDefault         = $env.properties.isDefault
-                    CreatedTime       = $env.properties.createdTime
-                    CollectDate       = (Get-Date -Format 'yyyy-MM-dd HH:mm')
-                }
-            }
-            Export-ToCsv -Data $envData -FileName "PowerPlatform_Environments_$date.csv"
-            Write-Log "  Power Platform environments via REST fallback: $($ppResp.value.Count)" 'SUCCESS'
-        }
-        catch {
-            if ($_.Exception.Message -eq 'SkipPowerPlatformRestFallback') { }
-            else {
-                $sc = $null
-                if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
-                if ($sc -in @(401, 403)) {
-                    Write-Log "  Power Platform environments unavailable ($sc — access denied)." 'WARN'
-                    Write-Log "    Ensure your account has 'Power Platform Administrator' role in Entra ID > Roles." 'WARN'
-                }
-                else {
-                    Write-Log "  Power Platform environments unavailable: $($_.Exception.Message)" 'WARN'
-                }
-            }
-        }
+        Write-Log "  Power Platform environments unavailable: isolated and native module collection both failed." 'WARN'
     }
 
     Write-Log "  Power Platform collection complete." 'SUCCESS'
 }
 
 #endregion
+
+function Get-IbGuidFromValue {
+    param([Parameter()] [object] $Value)
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+
+    # Accept either raw GUID or identity forms such as tenant\<guid>.
+    if ($text -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+        return $Matches[1]
+    }
+
+    return ''
+}
 
 #region Workload: Information Barriers
 
@@ -3202,23 +3168,9 @@ function Collect-InformationBarriersData {
     $spoConnected = $false
     $segmentNameByGuid = @{}
 
-    function Get-IbGuidFromValue {
-        param([Parameter()] [object] $Value)
-
-        $text = [string]$Value
-        if ([string]::IsNullOrWhiteSpace($text)) { return '' }
-
-        # Accept either raw GUID or identity forms such as tenant\<guid>.
-        if ($text -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
-            return $Matches[1]
-        }
-
-        return ''
-    }
-
+    $exoConnected = $false
     try {
         # Step 4: Org-level IB state from Exchange Online + Security & Compliance PowerShell.
-        $exoConnected = $false
         try {
             Write-Log "  Connecting to Exchange Online (interactive)..."
             Connect-ToExchangeOnline
@@ -3342,9 +3294,19 @@ function Collect-InformationBarriersData {
 
         # Step 5: SharePoint Online IB-related settings
         try {
+            # For Information Barriers, prefer WinPS compatibility session first in PS7.
+            # This isolates SPO from already-loaded EXO/Graph auth assemblies and avoids
+            # Microsoft.Identity.Client version binding conflicts in-process.
             if ($PSVersionTable.PSVersion.Major -gt 5) {
-                Import-Module Microsoft.Online.SharePoint.PowerShell `
-                    -UseWindowsPowerShell -DisableNameChecking -ErrorAction Stop
+                try {
+                    Import-Module Microsoft.Online.SharePoint.PowerShell `
+                        -UseWindowsPowerShell -DisableNameChecking -ErrorAction Stop
+                }
+                catch {
+                    Write-Log "  SPO module load via UseWindowsPowerShell failed; retrying via SkipEditionCheck: $($_.Exception.Message)" 'DEBUG'
+                    Import-Module Microsoft.Online.SharePoint.PowerShell `
+                        -SkipEditionCheck -DisableNameChecking -ErrorAction Stop
+                }
             }
             else {
                 Import-Module Microsoft.Online.SharePoint.PowerShell `
@@ -3378,10 +3340,7 @@ function Collect-InformationBarriersData {
         }
     }
     finally {
-        if ($exoConnected) {
-            try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-        }
-        if ($ippsConnected) {
+        if ($exoConnected -or $ippsConnected) {
             try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch {}
         }
         if ($spoConnected) {
