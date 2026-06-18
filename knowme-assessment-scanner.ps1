@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     MCA Data Collection Scanner — collects Microsoft 365 workload data for
     Microsoft Cloud Adoption assessments.
@@ -57,7 +57,7 @@
 
 .NOTES
     Author : Mike Lee
-    Version: 2.0
+    Version: 3.0
 #>
 
 function Start-ScannerInCleanPwshIfNeeded {
@@ -302,7 +302,17 @@ function Connect-ToMicrosoftGraph {
         'SecurityEvents.Read.All',
         'InformationProtectionPolicy.Read',
         'AuditLog.Read.All',
-        'UserAuthenticationMethod.Read.All'
+        'UserAuthenticationMethod.Read.All',
+        'RoleManagement.Read.Directory',
+        'PrivilegedAccess.Read.AzureAD',
+        'AccessReview.Read.All',
+        'Application.Read.All',
+        'DelegatedPermissionGrant.Read.All',
+        'DeviceManagementManagedDevices.Read.All',
+        'DeviceManagementConfiguration.Read.All',
+        'ServiceMessage.Read.All',
+        'ExternalConnection.Read.All',
+        'Organization.Read.All'
     )
 
     try {
@@ -312,8 +322,8 @@ function Connect-ToMicrosoftGraph {
     catch {
         $msg = $_.Exception.Message
         $isKnownMsalAssemblyConflict = $msg -match 'Method not found' -and
-            $msg -match 'BaseAbstractApplicationBuilder`1\.WithLogging' -and
-            $msg -match '(Microsoft\.Identity\.Client|Microsoft\.IdentityModel\.Abstractions)'
+        $msg -match 'BaseAbstractApplicationBuilder`1\.WithLogging' -and
+        $msg -match '(Microsoft\.Identity\.Client|Microsoft\.IdentityModel\.Abstractions)'
 
         if ($isKnownMsalAssemblyConflict) {
             Write-Log '  Graph interactive browser auth failed due to a known MSAL assembly conflict in the current host.' 'WARN'
@@ -606,7 +616,24 @@ function Connect-ToSecurityCompliance {
     }
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
-    Connect-IPPSSession -ShowBanner:$false -ErrorAction Stop
+    $connectParams = @{
+        ShowBanner  = $false
+        ErrorAction = 'Stop'
+    }
+    $ippsCommand = Get-Command -Name Connect-IPPSSession -ErrorAction Stop
+    if ($ippsCommand.Parameters.ContainsKey('CommandName')) {
+        $connectParams['CommandName'] = @(
+            'Get-Label',
+            'Get-DlpCompliancePolicy',
+            'Get-DlpComplianceRule',
+            'Get-AdminAuditLogConfig',
+            'Get-UnifiedAuditLogRetentionPolicy',
+            'Get-ProtectionAlert',
+            'Search-UnifiedAuditLog'
+        )
+    }
+
+    Connect-IPPSSession @connectParams
     Write-Log "  Connected to Security & Compliance PowerShell (interactive delegated auth)" 'SUCCESS'
 }
 
@@ -645,11 +672,11 @@ function Connect-ToPowerPlatformAdmin {
     catch {
         $msg = $_.Exception.Message
         $isAssemblyConflict = $msg -match 'Microsoft\.Identity\.Client' -or
-            $msg -match 'already loaded' -or
-            $msg -match 'Could not load file or assembly'
+        $msg -match 'already loaded' -or
+        $msg -match 'Could not load file or assembly'
 
         $canUseWinPSCompat = $PSVersionTable.PSVersion.Major -gt 5 -and
-            (Get-Command Import-Module).Parameters.ContainsKey('UseWindowsPowerShell')
+        (Get-Command Import-Module).Parameters.ContainsKey('UseWindowsPowerShell')
 
         if ($isAssemblyConflict -and $canUseWinPSCompat) {
             Write-Log '  Power Platform module import hit auth assembly conflict; retrying via Windows PowerShell compatibility session...' 'WARN'
@@ -2228,6 +2255,560 @@ function Collect-EntraIDData {
 
 #region Workload: Security & Compliance
 
+function New-CollectorStatusRow {
+    param(
+        [Parameter(Mandatory)] [string] $ObjectType,
+        [Parameter(Mandatory)] [string] $Status,
+        [Parameter()] [string] $Note = ''
+    )
+
+    return [PSCustomObject]@{
+        ObjectType  = $ObjectType
+        Status      = $Status
+        Note        = $Note
+        CollectDate = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+    }
+}
+
+function Invoke-GraphPagedRequestWithFallback {
+    param(
+        [Parameter(Mandatory)] [string[]] $Uris,
+        [Parameter(Mandatory)] [string] $Description
+    )
+
+    $lastError = $null
+    foreach ($uri in $Uris) {
+        try {
+            Write-Log "    Trying $Description endpoint: $uri" 'DEBUG'
+            return @(Invoke-GraphPagedRequest -Uri $uri)
+        }
+        catch {
+            $lastError = $_
+            Write-Log "    $Description endpoint failed: $($_.Exception.Message)" 'DEBUG'
+        }
+    }
+
+    if ($lastError) { throw $lastError }
+    throw "No $Description endpoint returned data."
+}
+
+function Collect-PurviewDlpPolicies {
+    try {
+        Write-Log "  Purview DLP policies..."
+        $policies = @(Get-DlpCompliancePolicy -ErrorAction Stop)
+        $policyRows = foreach ($policy in $policies) {
+            $row = ConvertTo-FlatCsvRow -InputObject $policy
+            if (-not ($row.PSObject.Properties.Name -contains 'Workload')) {
+                $row | Add-Member -NotePropertyName Workload -NotePropertyValue (($policy.Workload -join '; ')) -Force
+            }
+            if (-not ($row.PSObject.Properties.Name -contains 'Mode')) {
+                $modeValue = if ($policy.Mode) { $policy.Mode } elseif ($policy.State) { $policy.State } else { '' }
+                $row | Add-Member -NotePropertyName Mode -NotePropertyValue $modeValue -Force
+            }
+            $row
+        }
+        Export-ToCsv -Data $policyRows -FileName "Purview_DLPPolicies_$date.csv"
+
+        $rules = @(Get-DlpComplianceRule -ErrorAction Stop)
+        $ruleRows = foreach ($rule in $rules) {
+            $row = ConvertTo-FlatCsvRow -InputObject $rule
+            if (-not ($row.PSObject.Properties.Name -contains 'Policy')) {
+                $row | Add-Member -NotePropertyName Policy -NotePropertyValue $rule.ParentPolicyName -Force
+            }
+            $row
+        }
+        Export-ToCsv -Data $ruleRows -FileName "Purview_DLPRules_$date.csv"
+
+        $coverageRows = @($policies | ForEach-Object {
+                $workloads = @($_.Workload)
+                if ($workloads.Count -eq 0 -or [string]::IsNullOrWhiteSpace(($workloads -join ''))) {
+                    $workloads = @('Unspecified')
+                }
+                foreach ($workload in $workloads) {
+                    [PSCustomObject]@{
+                        Workload    = $workload
+                        Mode        = if ($_.Mode) { $_.Mode } elseif ($_.State) { $_.State } else { 'Unspecified' }
+                        PolicyName  = $_.Name
+                        Enabled     = $_.Enabled
+                        CollectDate = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+                    }
+                }
+            })
+        Export-ToCsv -Data $coverageRows -FileName "Purview_DLPCoverageSummary_$date.csv"
+        Write-Log "  DLP policies: $($policies.Count); rules: $($rules.Count)" 'SUCCESS'
+    }
+    catch {
+        Write-Log "  Purview DLP policies unavailable: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Collect-PurviewAuditConfigAndChangeEvents {
+    try {
+        Write-Log "  Purview audit configuration..."
+
+        if (Get-Command -Name Get-AdminAuditLogConfig -ErrorAction SilentlyContinue) {
+            $auditConfig = Get-AdminAuditLogConfig -ErrorAction Stop
+            Export-ToCsv -Data @(ConvertTo-FlatCsvRow -InputObject $auditConfig) -FileName "Purview_AuditConfig_$date.csv"
+        }
+        else {
+            Write-Log "  Get-AdminAuditLogConfig is unavailable in this session." 'WARN'
+        }
+
+        if (Get-Command -Name Get-UnifiedAuditLogRetentionPolicy -ErrorAction SilentlyContinue) {
+            $retentionPolicies = @(Get-UnifiedAuditLogRetentionPolicy -ErrorAction Stop)
+            $retentionRows = @(foreach ($policy in $retentionPolicies) { ConvertTo-FlatCsvRow -InputObject $policy })
+            if ($retentionRows.Count -eq 0) {
+                $retentionRows = @(New-CollectorStatusRow -ObjectType 'UnifiedAuditLogRetentionPolicy' -Status 'NoneReturned' -Note 'No explicit Unified Audit Log retention policies were returned.')
+            }
+            Export-ToCsv -Data $retentionRows -FileName "Purview_AuditRetentionPolicies_$date.csv"
+        }
+        else {
+            Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'UnifiedAuditLogRetentionPolicy' -Status 'CmdletUnavailable' -Note 'Get-UnifiedAuditLogRetentionPolicy is unavailable in this session.') -FileName "Purview_AuditRetentionPolicies_$date.csv"
+        }
+
+        if (Get-Command -Name Get-ProtectionAlert -ErrorAction SilentlyContinue) {
+            $alerts = @(Get-ProtectionAlert -ErrorAction Stop)
+            $alertRows = @(foreach ($alert in $alerts) { ConvertTo-FlatCsvRow -InputObject $alert })
+            if ($alertRows.Count -eq 0) {
+                $alertRows = @(New-CollectorStatusRow -ObjectType 'ProtectionAlert' -Status 'NoneReturned' -Note 'No Purview alert policies were returned.')
+            }
+            Export-ToCsv -Data $alertRows -FileName "Purview_AlertPolicies_$date.csv"
+        }
+        else {
+            Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'ProtectionAlert' -Status 'CmdletUnavailable' -Note 'Get-ProtectionAlert is unavailable in this session.') -FileName "Purview_AlertPolicies_$date.csv"
+        }
+
+        if (Get-Command -Name Search-UnifiedAuditLog -ErrorAction SilentlyContinue) {
+            $startDate = (Get-Date).AddDays(-30)
+            $endDate = Get-Date
+            $changeOperations = @(
+                'Add member to role',
+                'Remove member from role',
+                'Add eligible member to role',
+                'Remove eligible member from role',
+                'Add conditional access policy',
+                'Update conditional access policy',
+                'Delete conditional access policy',
+                'Set-DlpCompliancePolicy',
+                'Set-DlpComplianceRule',
+                'Set-SPOTenant',
+                'SharingSet',
+                'SiteCollectionAdminAdded',
+                'SiteCollectionAdminRemoved'
+            )
+
+            $changeEvents = @(Search-UnifiedAuditLog -StartDate $startDate -EndDate $endDate -Operations $changeOperations -ResultSize 5000 -ErrorAction Stop)
+            $changeRows = @(foreach ($event in $changeEvents) {
+                    $auditData = $null
+                    try { $auditData = $event.AuditData | ConvertFrom-Json -ErrorAction Stop } catch {}
+                    [PSCustomObject]@{
+                        CreationDate = $event.CreationDate
+                        Operation    = $event.Operations
+                        Workload     = $event.Workload
+                        UserIds      = $event.UserIds
+                        ObjectId     = if ($auditData) { $auditData.ObjectId } else { '' }
+                        ResultStatus = if ($auditData) { $auditData.ResultStatus } else { '' }
+                        CollectDate  = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+                    }
+                })
+            if ($changeRows.Count -eq 0) {
+                $changeRows = @(New-CollectorStatusRow -ObjectType 'UnifiedAuditLogChangeEvent' -Status 'NoneReturned' -Note 'No targeted configuration-change events were returned for the last 30 days.')
+            }
+            Export-ToCsv -Data $changeRows -FileName "Purview_AuditChangeEvents_$date.csv"
+
+            $copilotEvents = @(Search-UnifiedAuditLog -StartDate $startDate -EndDate $endDate -FreeText 'Copilot' -ResultSize 5000 -ErrorAction SilentlyContinue)
+            if ($copilotEvents.Count -gt 0) {
+                $copilotRows = foreach ($event in $copilotEvents) { ConvertTo-FlatCsvRow -InputObject $event }
+                Export-ToCsv -Data $copilotRows -FileName "Purview_CopilotAuditEvents_$date.csv"
+            }
+            else {
+                Export-ToCsv -Data @([PSCustomObject]@{
+                        EventType   = 'CopilotAuditEvents'
+                        EventCount  = 0
+                        StartDate   = $startDate
+                        EndDate     = $endDate
+                        CollectDate = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+                    }) -FileName "Purview_CopilotAuditEvents_$date.csv"
+            }
+        }
+        else {
+            Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'UnifiedAuditLogChangeEvent' -Status 'CmdletUnavailable' -Note 'Search-UnifiedAuditLog is unavailable in this session.') -FileName "Purview_AuditChangeEvents_$date.csv"
+            Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'CopilotAuditEvents' -Status 'CmdletUnavailable' -Note 'Search-UnifiedAuditLog is unavailable in this session.') -FileName "Purview_CopilotAuditEvents_$date.csv"
+        }
+    }
+    catch {
+        Write-Log "  Purview audit configuration/change telemetry unavailable: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Collect-EntraPrivilegedAccess {
+    try {
+        Write-Log "  Entra privileged access / PIM..."
+
+        $activeAssignments = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/beta/roleManagement/directory/roleAssignmentScheduleInstances?`$expand=principal,roleDefinition&`$top=999"
+        $eligibleAssignments = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/beta/roleManagement/directory/roleEligibilityScheduleInstances?`$expand=principal,roleDefinition&`$top=999"
+
+        $assignmentRows = @(
+            foreach ($assignment in $activeAssignments) {
+                [PSCustomObject]@{
+                    AssignmentType = 'Active'
+                    RoleName       = $assignment.roleDefinition.displayName
+                    RoleId         = $assignment.roleDefinitionId
+                    PrincipalId    = $assignment.principalId
+                    PrincipalName  = $assignment.principal.displayName
+                    PrincipalType  = $assignment.principal.'@odata.type'
+                    MemberType     = $assignment.memberType
+                    StartDateTime  = $assignment.startDateTime
+                    EndDateTime    = $assignment.endDateTime
+                    CollectDate    = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+                }
+            }
+            foreach ($assignment in $eligibleAssignments) {
+                [PSCustomObject]@{
+                    AssignmentType = 'Eligible'
+                    RoleName       = $assignment.roleDefinition.displayName
+                    RoleId         = $assignment.roleDefinitionId
+                    PrincipalId    = $assignment.principalId
+                    PrincipalName  = $assignment.principal.displayName
+                    PrincipalType  = $assignment.principal.'@odata.type'
+                    MemberType     = $assignment.memberType
+                    StartDateTime  = $assignment.startDateTime
+                    EndDateTime    = $assignment.endDateTime
+                    CollectDate    = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+                }
+            }
+        )
+        Export-ToCsv -Data $assignmentRows -FileName "EntraID_PIMRoleAssignments_$date.csv"
+
+        $copilotAdminRows = @($assignmentRows | Where-Object { $_.RoleName -match '^Copilot Administrator$|Microsoft 365 Copilot' })
+        if ($copilotAdminRows.Count -eq 0) {
+            $copilotAdminRows = @([PSCustomObject]@{
+                    AssignmentType = 'CopilotAdministrator'
+                    RoleName       = 'Copilot Administrator'
+                    PrincipalId    = ''
+                    PrincipalName  = ''
+                    PrincipalType  = ''
+                    MemberType     = ''
+                    StartDateTime  = ''
+                    EndDateTime    = ''
+                    Note           = 'No Copilot Administrator role assignments found in PIM active/eligible schedule instances.'
+                    CollectDate    = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+                })
+        }
+        Export-ToCsv -Data $copilotAdminRows -FileName "EntraID_CopilotAdminAssignments_$date.csv"
+
+        $startDate = (Get-Date).AddDays(-30).ToString('o')
+        $roleAudits = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=activityDateTime ge $startDate and category eq 'RoleManagement'&`$top=999"
+        $roleAuditRows = foreach ($audit in $roleAudits) { ConvertTo-FlatCsvRow -InputObject $audit }
+        Export-ToCsv -Data $roleAuditRows -FileName "EntraID_RoleManagementAuditEvents_$date.csv"
+
+        try {
+            $accessReviews = Invoke-GraphPagedRequestWithFallback -Description 'access review definitions' -Uris @(
+                "https://graph.microsoft.com/v1.0/identityGovernance/accessReviews/definitions?`$top=100",
+                "https://graph.microsoft.com/beta/identityGovernance/accessReviews/definitions?`$top=100"
+            )
+            $accessReviewRows = @(foreach ($review in $accessReviews) { ConvertTo-FlatCsvRow -InputObject $review })
+            if ($accessReviewRows.Count -eq 0) {
+                $accessReviewRows = @(New-CollectorStatusRow -ObjectType 'AccessReviewDefinition' -Status 'NoneReturned' -Note 'No access review definitions were returned.')
+            }
+            Export-ToCsv -Data $accessReviewRows -FileName "EntraID_AccessReviewDefinitions_$date.csv"
+        }
+        catch {
+            Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'AccessReviewDefinition' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "EntraID_AccessReviewDefinitions_$date.csv"
+            Write-Log "  Access review definitions unavailable: $($_.Exception.Message)" 'WARN'
+        }
+
+        Write-Log "  PIM assignments collected: active=$($activeAssignments.Count), eligible=$($eligibleAssignments.Count)" 'SUCCESS'
+    }
+    catch {
+        Write-Log "  Entra PIM/role governance unavailable: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Collect-EntraAppConsents {
+    try {
+        Write-Log "  Enterprise apps and OAuth consents..."
+
+        $servicePrincipals = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$select=id,appId,displayName,accountEnabled,verifiedPublisher,appOwnerOrganizationId,signInAudience&`$top=999"
+        $servicePrincipalById = @{}
+        foreach ($sp in $servicePrincipals) { $servicePrincipalById[$sp.id] = $sp }
+
+        $spRows = foreach ($sp in $servicePrincipals) {
+            [PSCustomObject]@{
+                Id                     = $sp.id
+                AppId                  = $sp.appId
+                DisplayName            = $sp.displayName
+                AccountEnabled         = $sp.accountEnabled
+                VerifiedPublisher      = $sp.verifiedPublisher.displayName
+                AppOwnerOrganizationId = $sp.appOwnerOrganizationId
+                SignInAudience         = $sp.signInAudience
+                HasVerifiedPublisher   = -not [string]::IsNullOrWhiteSpace([string]$sp.verifiedPublisher.displayName)
+                CollectDate            = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+            }
+        }
+        Export-ToCsv -Data $spRows -FileName "EntraID_ServicePrincipals_$date.csv"
+
+        $highRiskScopes = @(
+            'Mail.ReadWrite',
+            'Mail.ReadWrite.Shared',
+            'Files.ReadWrite.All',
+            'Sites.ReadWrite.All',
+            'Directory.ReadWrite.All',
+            'User.ReadWrite.All',
+            'Group.ReadWrite.All',
+            'Application.ReadWrite.All',
+            'RoleManagement.ReadWrite.Directory'
+        )
+
+        $delegatedGrants = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$top=999"
+        $delegatedRows = foreach ($grant in $delegatedGrants) {
+            $client = $servicePrincipalById[$grant.clientId]
+            $resource = $servicePrincipalById[$grant.resourceId]
+            $scopes = @($grant.scope -split ' ' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            [PSCustomObject]@{
+                GrantType      = 'Delegated'
+                ClientId       = $grant.clientId
+                ClientApp      = $client.displayName
+                ResourceId     = $grant.resourceId
+                ResourceApp    = $resource.displayName
+                ConsentType    = $grant.consentType
+                PrincipalId    = $grant.principalId
+                Scopes         = ($scopes -join '; ')
+                HighRiskScopes = (($scopes | Where-Object { $_ -in $highRiskScopes }) -join '; ')
+                CollectDate    = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+            }
+        }
+        Export-ToCsv -Data $delegatedRows -FileName "EntraID_OAuth2PermissionGrants_$date.csv"
+
+        $appRoleRows = [System.Collections.Generic.List[object]]::new()
+        foreach ($sp in $servicePrincipals) {
+            try {
+                $assignments = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($sp.id)/appRoleAssignments?`$top=999"
+                foreach ($assignment in $assignments) {
+                    $resource = $servicePrincipalById[$assignment.resourceId]
+                    $appRoleRows.Add([PSCustomObject]@{
+                            GrantType            = 'Application'
+                            ClientId             = $sp.id
+                            ClientApp            = $sp.displayName
+                            ResourceId           = $assignment.resourceId
+                            ResourceApp          = if ($resource) { $resource.displayName } else { $assignment.resourceDisplayName }
+                            AppRoleId            = $assignment.appRoleId
+                            PrincipalDisplayName = $assignment.principalDisplayName
+                            CreatedDateTime      = $assignment.createdDateTime
+                            CollectDate          = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+                        })
+                }
+            }
+            catch {
+                Write-Log "    App-role assignment lookup skipped for $($sp.displayName): $($_.Exception.Message)" 'DEBUG'
+            }
+        }
+        Export-ToCsv -Data @($appRoleRows) -FileName "EntraID_AppRoleAssignments_$date.csv"
+        Write-Log "  Service principals: $($servicePrincipals.Count); delegated grants: $($delegatedRows.Count); app-role grants: $($appRoleRows.Count)" 'SUCCESS'
+    }
+    catch {
+        Write-Log "  App consent/OAuth inventory unavailable: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Collect-IntuneDeviceCompliance {
+    try {
+        Write-Log "  Intune device compliance..."
+
+        $devices = Invoke-GraphPagedRequestWithFallback -Description 'Intune managed devices' -Uris @(
+            "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$top=999",
+            "https://graph.microsoft.com/beta/deviceManagement/managedDevices?`$top=999",
+            "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$select=id,deviceName,operatingSystem,complianceState,managedDeviceOwnerType,userPrincipalName,lastSyncDateTime&`$top=999"
+        )
+        $deviceRows = foreach ($device in $devices) {
+            [PSCustomObject]@{
+                DeviceId          = $device.id
+                DeviceName        = $device.deviceName
+                OperatingSystem   = $device.operatingSystem
+                ComplianceState   = $device.complianceState
+                ManagementAgent   = if ($device.PSObject.Properties.Name -contains 'managementAgent') { $device.managementAgent } else { '' }
+                OwnerType         = if ($device.PSObject.Properties.Name -contains 'managedDeviceOwnerType') { $device.managedDeviceOwnerType } elseif ($device.PSObject.Properties.Name -contains 'ownerType') { $device.ownerType } else { '' }
+                UserPrincipalName = $device.userPrincipalName
+                LastSyncDateTime  = $device.lastSyncDateTime
+                CollectDate       = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+            }
+        }
+        if ($deviceRows.Count -eq 0) {
+            $deviceRows = @(New-CollectorStatusRow -ObjectType 'ManagedDevice' -Status 'NoneReturned' -Note 'No Intune managed devices were returned.')
+        }
+        Export-ToCsv -Data $deviceRows -FileName "Intune_ManagedDevices_$date.csv"
+
+        $summaryRows = @($devices | Group-Object -Property complianceState | ForEach-Object {
+                New-ObjectCountSummary -ObjectType 'ManagedDevice' -Count $_.Count -AdditionalProperties @{
+                    GroupingProperty = 'ComplianceState'
+                    GroupingValue    = if ([string]::IsNullOrWhiteSpace([string]$_.Name)) { 'Unspecified' } else { $_.Name }
+                }
+            })
+        if ($summaryRows.Count -eq 0) {
+            $summaryRows = @(New-ObjectCountSummary -ObjectType 'ManagedDevice' -Count 0 -AdditionalProperties @{
+                    GroupingProperty = 'ComplianceState'
+                    GroupingValue    = 'None'
+                })
+        }
+        Export-ToCsv -Data $summaryRows -FileName "Intune_DeviceComplianceSummary_$date.csv"
+
+        $policies = Invoke-GraphPagedRequestWithFallback -Description 'Intune compliance policies' -Uris @(
+            "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicies?`$top=999",
+            "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies?`$top=999"
+        )
+        $policyRows = @(foreach ($policy in $policies) { ConvertTo-FlatCsvRow -InputObject $policy })
+        if ($policyRows.Count -eq 0) {
+            $policyRows = @(New-CollectorStatusRow -ObjectType 'DeviceCompliancePolicy' -Status 'NoneReturned' -Note 'No Intune device compliance policies were returned.')
+        }
+        Export-ToCsv -Data $policyRows -FileName "Intune_DeviceCompliancePolicies_$date.csv"
+
+        try {
+            $stateSummary = $null
+            foreach ($uri in @(
+                    "https://graph.microsoft.com/v1.0/deviceManagement/deviceCompliancePolicyDeviceStateSummary",
+                    "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicyDeviceStateSummary"
+                )) {
+                try {
+                    $stateSummary = Invoke-GraphRequestWithThrottleHandling -Uri $uri -Method 'GET'
+                    break
+                }
+                catch {
+                    Write-Log "    Intune compliance state summary endpoint failed: $($_.Exception.Message)" 'DEBUG'
+                }
+            }
+            if (-not $stateSummary) { throw 'No Intune compliance state summary endpoint returned data.' }
+            Export-ToCsv -Data @(ConvertTo-FlatCsvRow -InputObject $stateSummary) -FileName "Intune_DeviceCompliancePolicyStateSummary_$date.csv"
+        }
+        catch {
+            Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'DeviceCompliancePolicyStateSummary' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "Intune_DeviceCompliancePolicyStateSummary_$date.csv"
+            Write-Log "  Intune compliance state summary unavailable: $($_.Exception.Message)" 'WARN'
+        }
+
+        try {
+            $configProfiles = Invoke-GraphPagedRequestWithFallback -Description 'Intune device configuration profiles' -Uris @(
+                "https://graph.microsoft.com/v1.0/deviceManagement/deviceConfigurations?`$top=999",
+                "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations?`$top=999"
+            )
+            $configRows = @(foreach ($profile in $configProfiles) { ConvertTo-FlatCsvRow -InputObject $profile })
+            if ($configRows.Count -eq 0) {
+                $configRows = @(New-CollectorStatusRow -ObjectType 'DeviceConfigurationProfile' -Status 'NoneReturned' -Note 'No Intune device configuration profiles were returned.')
+            }
+            Export-ToCsv -Data $configRows -FileName "Intune_DeviceConfigurationProfiles_$date.csv"
+        }
+        catch {
+            Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'DeviceConfigurationProfile' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "Intune_DeviceConfigurationProfiles_$date.csv"
+            Write-Log "  Intune device configuration profiles unavailable: $($_.Exception.Message)" 'WARN'
+        }
+
+        Write-Log "  Intune managed devices: $($devices.Count); compliance policies: $($policies.Count)" 'SUCCESS'
+    }
+    catch {
+        Write-Log "  Intune device compliance unavailable: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Collect-EntraGroupGovernance {
+    try {
+        Write-Log "  Ownerless M365 groups and naming policy..."
+
+        $groups = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/groups?`$select=id,displayName,mail,groupTypes,createdDateTime&`$top=999"
+        $m365Groups = @($groups | Where-Object { $_.groupTypes -contains 'Unified' })
+
+        $ownerRows = foreach ($group in $m365Groups) {
+            $owners = @(Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/groups/$($group.id)/owners?`$select=id,displayName,userPrincipalName&`$top=999")
+            [PSCustomObject]@{
+                OwnerCount = $owners.Count
+            }
+        }
+
+        $atRiskGroups = @($ownerRows | Where-Object { $_.OwnerCount -le 1 })
+        $zeroOwnerCount = @($ownerRows | Where-Object { $_.OwnerCount -eq 0 }).Count
+        $singleOwnerCount = @($ownerRows | Where-Object { $_.OwnerCount -eq 1 }).Count
+        $ownerlessSummary = @([PSCustomObject]@{
+                ObjectType                   = 'Microsoft365Group'
+                TotalMicrosoft365Groups      = $m365Groups.Count
+                GroupsWithZeroOwners         = $zeroOwnerCount
+                GroupsWithOneOwner           = $singleOwnerCount
+                GroupsWithOneOrFewerOwners   = $atRiskGroups.Count
+                PercentWithOneOrFewerOwners  = if ($m365Groups.Count -gt 0) { [math]::Round(($atRiskGroups.Count / $m365Groups.Count) * 100, 2) } else { 0 }
+                MinimumRecommendedOwnerCount = 2
+                CollectDate                  = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+            })
+        Export-ToCsv -Data $ownerlessSummary -FileName "EntraID_OwnerlessOrSingleOwnerGroups_$date.csv"
+
+        try {
+            $settings = Invoke-GraphPagedRequestWithFallback -Description 'group naming settings' -Uris @(
+                "https://graph.microsoft.com/v1.0/groupSettings?`$top=999",
+                "https://graph.microsoft.com/beta/groupSettings?`$top=999",
+                "https://graph.microsoft.com/beta/settings?`$top=999",
+                "https://graph.microsoft.com/beta/directory/settings?`$top=999"
+            )
+            $groupSettings = @($settings | Where-Object {
+                    $_.displayName -eq 'Group.Unified' -or
+                    $_.templateId -eq '62375ab9-6b52-47ed-826b-58e47e0e304b'
+                })
+            $settingRows = @(foreach ($setting in $groupSettings) { ConvertTo-FlatCsvRow -InputObject $setting })
+            if ($settingRows.Count -eq 0) {
+                $settingRows = @(New-CollectorStatusRow -ObjectType 'GroupNamingPolicy' -Status 'NoneReturned' -Note 'No Group.Unified tenant group settings were returned.')
+            }
+            Export-ToCsv -Data $settingRows -FileName "EntraID_GroupNamingPolicy_$date.csv"
+            Write-Log "  M365 groups: $($m365Groups.Count); groups with <=1 owner: $($atRiskGroups.Count); group naming settings: $($settingRows.Count)" 'SUCCESS'
+        }
+        catch {
+            Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'GroupNamingPolicy' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "EntraID_GroupNamingPolicy_$date.csv"
+            Write-Log "  Group naming policy unavailable: $($_.Exception.Message)" 'WARN'
+            Write-Log "  M365 groups: $($m365Groups.Count); groups with <=1 owner: $($atRiskGroups.Count)" 'SUCCESS'
+        }
+    }
+    catch {
+        Write-Log "  Group governance unavailable: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Collect-ServiceCommsAndGraphConnectors {
+    try {
+        Write-Log "  Message Center posts..."
+        $messages = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/admin/serviceAnnouncement/messages?`$top=100"
+        $messageRows = foreach ($message in $messages) {
+            [PSCustomObject]@{
+                Id            = $message.id
+                Title         = $message.title
+                Category      = $message.category
+                Severity      = $message.severity
+                StartDateTime = $message.startDateTime
+                EndDateTime   = $message.endDateTime
+                IsMajorChange = $message.isMajorChange
+                Services      = ($message.services -join '; ')
+                Tags          = ($message.tags -join '; ')
+                CollectDate   = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+            }
+        }
+        Export-ToCsv -Data $messageRows -FileName "M365_MessageCenterPosts_$date.csv"
+        Write-Log "  Message Center posts: $($messageRows.Count)" 'SUCCESS'
+    }
+    catch {
+        Write-Log "  Message Center posts unavailable: $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        Write-Log "  Microsoft Graph connectors..."
+        $connections = Invoke-GraphPagedRequestWithFallback -Description 'Graph connector inventory' -Uris @(
+            "https://graph.microsoft.com/v1.0/external/connections?`$top=999",
+            "https://graph.microsoft.com/beta/external/connections?`$top=999"
+        )
+        $connectionRows = @(foreach ($connection in $connections) { ConvertTo-FlatCsvRow -InputObject $connection })
+        if ($connectionRows.Count -eq 0) {
+            $connectionRows = @(New-CollectorStatusRow -ObjectType 'ExternalConnection' -Status 'NoneReturned' -Note 'No Microsoft Graph connectors were returned.')
+        }
+        Export-ToCsv -Data $connectionRows -FileName "MicrosoftSearch_GraphConnectors_$date.csv"
+        Write-Log "  Graph connectors: $($connectionRows.Count)" 'SUCCESS'
+    }
+    catch {
+        Export-ToCsv -Data @(New-CollectorStatusRow -ObjectType 'ExternalConnection' -Status 'Unavailable' -Note $_.Exception.Message) -FileName "MicrosoftSearch_GraphConnectors_$date.csv"
+        Write-Log "  Graph connector inventory unavailable: $($_.Exception.Message)" 'WARN'
+    }
+}
+
 function Collect-SecurityData {
     Write-Log ""
     Write-Log "==  Security & Compliance  ==" 'SUCCESS'
@@ -2236,7 +2817,8 @@ function Collect-SecurityData {
     # --- Secure Score ---
     try {
         Write-Log "  Secure Score..."
-        $scores = Invoke-GraphPagedRequest -Uri 'https://graph.microsoft.com/v1.0/security/secureScores?$top=1'
+        $scoreResponse = Invoke-GraphRequestWithThrottleHandling -Uri 'https://graph.microsoft.com/v1.0/security/secureScores?$top=1' -Method 'GET'
+        $scores = @($scoreResponse.value)
         if ($scores -and $scores.Count -gt 0) {
             $ss = $scores[0]
             $avgScore = ($ss.averageComparativeScores | Where-Object { $_.basis -eq 'AllTenants' } |
@@ -2347,6 +2929,20 @@ function Collect-SecurityData {
     catch { Write-Log "  Named locations unavailable: $($_.Exception.Message)" 'WARN' }
 
     if ($ippsConnected) {
+        Collect-PurviewDlpPolicies
+        Collect-PurviewAuditConfigAndChangeEvents
+    }
+    else {
+        Write-Log "  Skipping Purview DLP and audit collectors because Security & Compliance PowerShell is not connected." 'WARN'
+    }
+
+    Collect-EntraPrivilegedAccess
+    Collect-EntraAppConsents
+    Collect-IntuneDeviceCompliance
+    Collect-EntraGroupGovernance
+    Collect-ServiceCommsAndGraphConnectors
+
+    if ($ippsConnected) {
         try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
         Write-Log "  Disconnected from Security & Compliance PowerShell" 'DEBUG'
     }
@@ -2417,16 +3013,16 @@ function Collect-PowerPlatformData {
         catch {
             if ($_.Exception.Message -eq 'SkipPbiRestFallback') { }
             else {
-            $sc = $null
-            if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
-            if ($sc -in @(401, 403)) {
-                Write-Log "  Power BI workspaces unavailable ($sc — access denied)." 'WARN'
-                Write-Log "    Ensure your account has 'Power BI Administrator' or 'Global Administrator' role." 'WARN'
-                Write-Log "    In Power BI Admin portal: Tenant settings -> Allow users to use Power BI APIs." 'WARN'
-            }
-            else {
-                Write-Log "  Power BI workspaces unavailable: $($_.Exception.Message)" 'WARN'
-            }
+                $sc = $null
+                if ($_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode }
+                if ($sc -in @(401, 403)) {
+                    Write-Log "  Power BI workspaces unavailable ($sc — access denied)." 'WARN'
+                    Write-Log "    Ensure your account has 'Power BI Administrator' or 'Global Administrator' role." 'WARN'
+                    Write-Log "    In Power BI Admin portal: Tenant settings -> Allow users to use Power BI APIs." 'WARN'
+                }
+                else {
+                    Write-Log "  Power BI workspaces unavailable: $($_.Exception.Message)" 'WARN'
+                }
             }
         }
     }
