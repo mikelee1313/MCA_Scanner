@@ -759,7 +759,7 @@ function Show-WorkloadMenu {
 
 function Export-ToCsv {
     param(
-        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Data,
+        [Parameter(Mandatory)] [AllowNull()] [AllowEmptyCollection()] [object[]] $Data,
         [Parameter(Mandatory)] [string]   $FileName
     )
     if ($null -eq $Data -or $Data.Count -eq 0) {
