@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    MCA Data Collection Scanner — collects Microsoft 365 workload data for
+    MCA Data Collection Scanner - collects Microsoft 365 workload data for
     Microsoft Cloud Adoption assessments.
 
 .DESCRIPTION
@@ -12,7 +12,7 @@
       SharePoint Online [1] and OneDrive for Business [4] use the
       Microsoft.Online.SharePoint.PowerShell module with interactive
       (delegated) authentication via Connect-SPOService.  No Entra ID app
-      registration is required — any SharePoint Administrator can run these
+    registration is required - any SharePoint Administrator can run these
       workloads.
 
       Each workload prefers its native administration module.  SharePoint Online
@@ -69,10 +69,11 @@ function Start-ScannerInCleanPwshIfNeeded {
     #>
     if ($env:MCA_SCANNER_ISOLATED -eq '1') { return }
 
-    $needsPwsh7 = $PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7
     $isVsCodeHost = ($Host.Name -match 'Visual Studio Code') -or ($env:TERM_PROGRAM -eq 'vscode')
 
-    if (-not ($needsPwsh7 -or $isVsCodeHost)) { return }
+    # Keep Windows PowerShell 5.1 native; only isolate PowerShell 7 sessions
+    # that are running inside an integrated host.
+    if ($PSVersionTable.PSEdition -ne 'Core' -or -not $isVsCodeHost) { return }
 
     $pwsh = Get-Command -Name 'pwsh' -ErrorAction SilentlyContinue
     if (-not $pwsh) {
@@ -347,7 +348,7 @@ function Test-ValidToken {
     }
     $ctx = Get-MgContext -ErrorAction SilentlyContinue
     if (-not $ctx) {
-        Write-Log 'Microsoft Graph session expired — reconnecting...' 'WARN'
+        Write-Log 'Microsoft Graph session expired - reconnecting...' 'WARN'
         $global:mgConnected = $false
         Connect-ToMicrosoftGraph
     }
@@ -671,9 +672,14 @@ function Get-PowerPlatformEnvironmentsIsolated {
         [Parameter(Mandatory)] [string] $TenantId
     )
 
-    $pwsh = Get-Command -Name 'pwsh' -ErrorAction SilentlyContinue
-    if (-not $pwsh) {
-        throw 'PowerShell 7 (pwsh) was not found for isolated Power Platform collection.'
+    $childHost = if ($PSVersionTable.PSEdition -eq 'Core') {
+        Get-Command -Name 'pwsh' -ErrorAction SilentlyContinue
+    }
+    else {
+        Get-Command -Name 'powershell.exe' -ErrorAction SilentlyContinue
+    }
+    if (-not $childHost) {
+        throw 'No compatible PowerShell host was found for isolated Power Platform collection.'
     }
 
     $tmpPath = Join-Path ([System.IO.Path]::GetTempPath()) ("mca_pp_env_{0}_{1}.json" -f $PID, [Guid]::NewGuid().ToString('N'))
@@ -699,7 +705,7 @@ Add-PowerAppsAccount -Endpoint 'prod' -TenantID '$TenantId' -ErrorAction Stop | 
 
     try {
         $cmd = "& { $scriptText } | Set-Content -Path '$tmpPath' -Encoding UTF8"
-        & $pwsh.Source -NoProfile -Command $cmd
+        & $childHost.Source -NoProfile -Command $cmd
         if (-not (Test-Path $tmpPath)) {
             throw 'Isolated Power Platform collection did not produce output.'
         }
@@ -780,7 +786,7 @@ function Collect-SharePointData {
     Write-Log "==  SharePoint Online  ==" 'SUCCESS'
 
     if ([string]::IsNullOrWhiteSpace($tenantUrl)) {
-        Write-Log "  Skipping SharePoint Online — `$tenantUrl not configured in the Configuration section." 'WARN'
+        Write-Log "  Skipping SharePoint Online - `$tenantUrl not configured in the Configuration section." 'WARN'
         return
     }
 
@@ -1400,7 +1406,7 @@ function Collect-SharePointData {
                 [PSCustomObject]@{
                     Property    = $propName
                     Value       = $val
-                    Description = if ($spoDescriptions.ContainsKey($propName)) { $spoDescriptions[$propName] } else { '(no description — verify property name)' }
+                    Description = if ($spoDescriptions.ContainsKey($propName)) { $spoDescriptions[$propName] } else { '(no description - verify property name)' }
                     CollectDate = (Get-Date -Format 'yyyy-MM-dd HH:mm')
                 }
             }
@@ -1431,7 +1437,7 @@ function Collect-ExchangeData {
     Write-Log "==  Exchange Online  ==" 'SUCCESS'
 
     #---------------------------------------------------------------------------
-    # PART 1 — ExchangeOnlineManagement PS module
+            # PART 1 - ExchangeOnlineManagement PS module
     #---------------------------------------------------------------------------
     Write-Log "  Connecting ExchangeOnlineManagement PS module for detailed config..."
     $exoModuleConnected = $false
@@ -1451,7 +1457,7 @@ function Collect-ExchangeData {
 
     if ($exoModuleConnected) {
         try {
-            # Inline helper — same *>&1 noise-suppression pattern as the Teams $Collect.
+            # Inline helper - same *>&1 noise-suppression pattern as the Teams $Collect.
             $ExCollect = {
                 param([string]$Label, [string]$FileName, [scriptblock]$Cmd)
                 Write-Log "  $Label..." 'DEBUG'
@@ -1573,10 +1579,10 @@ function Collect-ExchangeData {
             & $ExCollect 'CASMailboxPlans' "EXO_CASMailboxPlans_$date.csv" { Get-CASMailboxPlan }
 
             # ---- Mail flow --------------------------------------------------------------
-            # Accepted domains — also used below for DNS checks and vanity-namespace flag
+            # Accepted domains - also used below for DNS checks and vanity-namespace flag
             & $ExCollect 'AcceptedDomains'    "EXO_AcceptedDomains_$date.csv" { Get-AcceptedDomain }
             & $ExCollect 'RemoteDomains'      "EXO_RemoteDomains_$date.csv" { Get-RemoteDomain }
-            # Connectors — inbound/outbound; UseMXRecord=False outbound = centralized mail flow
+            # Connectors - inbound/outbound; UseMXRecord=False outbound = centralized mail flow
             & $ExCollect 'InboundConnectors'  "EXO_InboundConnectors_$date.csv" { Get-InboundConnector }
             & $ExCollect 'OutboundConnectors' "EXO_OutboundConnectors_$date.csv" { Get-OutboundConnector }
             & $ExCollect 'TransportRules'     "EXO_TransportRules_$date.csv" { Get-TransportRule }
@@ -1588,11 +1594,11 @@ function Collect-ExchangeData {
             & $ExCollect 'SafeAttachmentPolicies' "EXO_SafeAttachmentPolicies_$date.csv" { Get-SafeAttachmentPolicy }
             # EOP anti-spam / malware / connection filters
             & $ExCollect 'InboundSpamFilter'      "EXO_InboundSpamFilter_$date.csv" { Get-HostedContentFilterPolicy }
-            # OutboundSpamFilter — AutoForwardingMode column answers "Is auto-forwarding allowed?"
+            # OutboundSpamFilter - AutoForwardingMode column answers "Is auto-forwarding allowed?"
             & $ExCollect 'OutboundSpamFilter'     "EXO_OutboundSpamFilter_$date.csv" { Get-HostedOutboundSpamFilterPolicy }
             & $ExCollect 'MalwareFilter'          "EXO_MalwareFilter_$date.csv" { Get-MalwareFilterPolicy }
             & $ExCollect 'ConnectionFilter'       "EXO_ConnectionFilter_$date.csv" { Get-HostedConnectionFilterPolicy }
-            # DKIM signing config — Enabled/Status per domain
+            # DKIM signing config - Enabled/Status per domain
             & $ExCollect 'DkimSigningConfig'      "EXO_DkimSigningConfig_$date.csv" { Get-DkimSigningConfig }
 
             # ---- Message encryption & compliance ---------------------------------------
@@ -1600,7 +1606,7 @@ function Collect-ExchangeData {
             & $ExCollect 'OMEConfig'  "EXO_OMEConfig_$date.csv" { Get-OMEConfiguration }
 
             # ---- Collaboration ---------------------------------------------------------
-            # SharingPolicy — answers "Is calendar sharing enabled / what's the scope?"
+            # SharingPolicy - answers "Is calendar sharing enabled / what's the scope?"
             & $ExCollect 'SharingPolicies' "EXO_SharingPolicies_$date.csv" { Get-SharingPolicy }
 
             # ---- Compliance / retention / hold -----------------------------------------
@@ -1683,7 +1689,7 @@ function Collect-ExchangeData {
                         }) -FileName "EXO_PublicFoldersSummary_$date.csv"
                 }
                 else {
-                    Write-Log "  Public folders detected — collecting top-level tree..."
+                    Write-Log "  Public folders detected - collecting top-level tree..."
                     $pfData = @(Get-PublicFolder -Recurse -ResultSize 500 *>&1) |
                     Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] -and $null -ne $_ -and $_ -isnot [string] }
                     if ($pfData.Count -gt 0) {
@@ -1708,7 +1714,7 @@ function Collect-ExchangeData {
     }
 
     #---------------------------------------------------------------------------
-    # PART 2 — DNS security checks: MX, SPF, DKIM, DMARC
+    # PART 2 - DNS security checks: MX, SPF, DKIM, DMARC
     # Domain list sourced from the native Get-AcceptedDomain export.
     # Skipped silently if Resolve-DnsName is unavailable (non-Windows platform).
     #---------------------------------------------------------------------------
@@ -1722,10 +1728,10 @@ function Collect-ExchangeData {
                 Select-Object -ExpandProperty DomainName)
         }
         if ($checkDomains.Count -eq 0) {
-            Write-Log "  DNS checks skipped — no non-onmicrosoft.com accepted domains found from Exchange Online" 'WARN'
+            Write-Log "  DNS checks skipped - no non-onmicrosoft.com accepted domains found from Exchange Online" 'WARN'
         }
         elseif (-not (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)) {
-            Write-Log "  DNS checks skipped — Resolve-DnsName not available on this platform" 'WARN'
+            Write-Log "  DNS checks skipped - Resolve-DnsName not available on this platform" 'WARN'
         }
         else {
             $dnsRows = foreach ($dom in $checkDomains) {
@@ -1898,9 +1904,9 @@ function Collect-TeamsData {
             # raw "Access Denied / Correlation id" console spam that some CS cmdlets
             # emit as non-terminating errors or via Write-Host, regardless of
             # $ErrorActionPreference.  We then split the captured objects by type:
-            #   - ErrorRecord  → treated as an error; shows FIX hint if Access Denied
-            #   - *Record types / strings → discarded (banners, verbose noise)
-            #   - everything else → legitimate cmdlet output, exported to CSV
+            #   - ErrorRecord  -> treated as an error; shows FIX hint if Access Denied
+            #   - *Record types / strings -> discarded (banners, verbose noise)
+            #   - everything else -> legitimate cmdlet output, exported to CSV
             $Collect = {
                 param([string]$Label, [string]$FileName, [scriptblock]$Cmd)
                 Write-Log "  $Label..." 'DEBUG'
@@ -1999,7 +2005,7 @@ function Collect-OneDriveData {
     Write-Log "==  OneDrive for Business  ==" 'SUCCESS'
 
     if ([string]::IsNullOrWhiteSpace($tenantUrl)) {
-        Write-Log "  Skipping OneDrive for Business — `$tenantUrl not configured in the Configuration section." 'WARN'
+        Write-Log "  Skipping OneDrive for Business - `$tenantUrl not configured in the Configuration section." 'WARN'
         return
     }
 
@@ -3362,7 +3368,7 @@ function Write-SummaryReport {
 
     Write-Host ""
     Write-Host "  ============================================================" -ForegroundColor Cyan
-    Write-Host "   MCA Assessment Scan — Summary" -ForegroundColor White
+    Write-Host "   MCA Assessment Scan - Summary" -ForegroundColor White
     Write-Host "   Completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm')" -ForegroundColor DarkGray
     Write-Host "  ============================================================" -ForegroundColor Cyan
     Write-Host ""
@@ -3399,7 +3405,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($tenantId)) { throw 'TenantId is empty. Fill in the Configuration section.' }
     if ([string]::IsNullOrWhiteSpace($tenantUrl)) { throw 'tenantUrl is empty. Fill in the Configuration section.' }
 
-    # Show workload menu — auth validation happens after so SPO/ODB can run without app credentials
+    # Show workload menu - auth validation happens after so SPO/ODB can run without app credentials
     $choice = Show-WorkloadMenu
 
     if ($choice -eq 'Q') {
