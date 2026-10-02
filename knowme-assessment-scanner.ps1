@@ -8,6 +8,11 @@
     and usage data for the selected workload(s).  Each workload's data is
     exported to timestamped CSV files in $OutputFolder.
 
+    Before collection, the scanner checks modules required by the selected
+    workloads.  Missing modules can be installed for the current user, or the
+    administrator can continue with affected collectors unavailable/fallback-only.
+    The scanner never installs modules without an explicit choice.
+
     AUTHENTICATION:
       SharePoint Online [1] and OneDrive for Business [4] use the
       Microsoft.Online.SharePoint.PowerShell module with interactive
@@ -851,6 +856,149 @@ function Show-WorkloadMenu {
     } while ($choice -notin $valid)
 
     return $choice
+}
+
+function Get-ScannerModuleCatalog {
+    return @(
+        [PSCustomObject]@{
+            ModuleName  = 'Microsoft.Online.SharePoint.PowerShell'
+            InstallName = 'Microsoft.Online.SharePoint.PowerShell'
+            WorkloadIds = @('1', '4', '8')
+            Impact      = 'SharePoint Online, OneDrive for Business, and SharePoint Information Barriers settings.'
+            IsOptional  = $false
+        }
+        [PSCustomObject]@{
+            ModuleName  = 'ExchangeOnlineManagement'
+            InstallName = 'ExchangeOnlineManagement'
+            WorkloadIds = @('2', '6', '8')
+            Impact      = 'Exchange Online, Security & Compliance PowerShell, and Information Barriers Exchange collectors.'
+            IsOptional  = $false
+        }
+        [PSCustomObject]@{
+            ModuleName  = 'MicrosoftTeams'
+            InstallName = 'MicrosoftTeams'
+            WorkloadIds = @('3')
+            Impact      = 'Teams policies and tenant configuration.'
+            IsOptional  = $false
+        }
+        [PSCustomObject]@{
+            ModuleName  = 'Microsoft.Graph.Authentication'
+            InstallName = 'Microsoft.Graph.Authentication'
+            WorkloadIds = @('2', '3', '5', '6')
+            Impact      = 'Graph-backed reports for Exchange and Teams, plus Entra ID and Graph-backed security collectors.'
+            IsOptional  = $false
+        }
+        [PSCustomObject]@{
+            ModuleName  = 'Microsoft.Graph.Reports'
+            InstallName = 'Microsoft.Graph.Reports'
+            WorkloadIds = @('2')
+            Impact      = 'Detailed D30 mailbox usage summary. Without it, the existing aggregate Graph reports are used as fallback.'
+            IsOptional  = $true
+        }
+        [PSCustomObject]@{
+            ModuleName  = 'MicrosoftPowerBIMgmt.Profile'
+            InstallName = 'MicrosoftPowerBIMgmt'
+            WorkloadIds = @('7')
+            Impact      = 'Power BI sign-in and collections.'
+            IsOptional  = $false
+        }
+        [PSCustomObject]@{
+            ModuleName  = 'MicrosoftPowerBIMgmt.Workspaces'
+            InstallName = 'MicrosoftPowerBIMgmt'
+            WorkloadIds = @('7')
+            Impact      = 'Power BI workspace collection.'
+            IsOptional  = $false
+        }
+        [PSCustomObject]@{
+            ModuleName  = 'MicrosoftPowerBIMgmt.Capacities'
+            InstallName = 'MicrosoftPowerBIMgmt'
+            WorkloadIds = @('7')
+            Impact      = 'Power BI capacity collection.'
+            IsOptional  = $false
+        }
+        [PSCustomObject]@{
+            ModuleName  = 'Microsoft.PowerApps.Administration.PowerShell'
+            InstallName = 'Microsoft.PowerApps.Administration.PowerShell'
+            WorkloadIds = @('7')
+            Impact      = 'Power Platform environment collection.'
+            IsOptional  = $false
+        }
+    )
+}
+
+function Get-MissingScannerModules {
+    param([Parameter(Mandatory)] [string[]] $WorkloadIds)
+
+    $selectedWorkloadIds = @($WorkloadIds)
+    $relevantModules = @(Get-ScannerModuleCatalog | Where-Object {
+            $module = $_
+            @($module.WorkloadIds | Where-Object { $selectedWorkloadIds -contains $_ }).Count -gt 0
+        })
+
+    return @($relevantModules | Where-Object {
+            -not (Get-Module -ListAvailable -Name $_.ModuleName | Select-Object -First 1)
+        })
+}
+
+function Invoke-ScannerModulePreflight {
+    param([Parameter(Mandatory)] [string[]] $WorkloadIds)
+
+    $missingModules = @(Get-MissingScannerModules -WorkloadIds $WorkloadIds)
+    if ($missingModules.Count -eq 0) {
+        return [PSCustomObject]@{ Cancelled = $false; MissingModules = @() }
+    }
+
+    $canInstallModules = $null -ne (Get-Command -Name 'Install-Module' -ErrorAction SilentlyContinue)
+    while ($missingModules.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Module preflight found missing PowerShell modules:" -ForegroundColor Yellow
+        foreach ($module in $missingModules) {
+            $kind = if ($module.IsOptional) { 'Optional enhancement' } else { 'Required for' }
+            Write-Host "    $($module.ModuleName) [$kind]" -ForegroundColor White
+            Write-Host "      Impact: $($module.Impact)" -ForegroundColor DarkGray
+            Write-Host "      Install: Install-Module -Name $($module.InstallName) -Scope CurrentUser" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+
+        if ($canInstallModules) {
+            Write-Host "    [I] Install missing modules for the current user" -ForegroundColor Green
+        }
+        else {
+            Write-Host "    Install-Module is unavailable; use the Install commands above manually." -ForegroundColor Yellow
+        }
+        Write-Host "    [C] Continue with available modules (affected collectors may be skipped or use fallbacks)" -ForegroundColor White
+        Write-Host "    [Q] Quit without scanning" -ForegroundColor Red
+
+        $validChoices = if ($canInstallModules) { @('I', 'C', 'Q') } else { @('C', 'Q') }
+        do {
+            $answer = (Read-Host "  Choose").Trim().ToUpperInvariant()
+        } while ($answer -notin $validChoices)
+
+        if ($answer -eq 'Q') {
+            return [PSCustomObject]@{ Cancelled = $true; MissingModules = $missingModules }
+        }
+        if ($answer -eq 'C') {
+            return [PSCustomObject]@{ Cancelled = $false; MissingModules = $missingModules }
+        }
+
+        $installNames = @($missingModules | Select-Object -ExpandProperty InstallName -Unique)
+        foreach ($installName in $installNames) {
+            try {
+                Write-Host "  Installing $installName for the current user..." -ForegroundColor Cyan
+                Install-Module -Name $installName -Scope CurrentUser -ErrorAction Stop | Out-Null
+            }
+            catch {
+                Write-Host "  Installation failed for ${installName}: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+
+        $missingModules = @(Get-MissingScannerModules -WorkloadIds $WorkloadIds)
+        if ($missingModules.Count -eq 0) {
+            Write-Host "  Required modules are available. Continuing." -ForegroundColor Green
+        }
+    }
+
+    return [PSCustomObject]@{ Cancelled = $false; MissingModules = @() }
 }
 
 function Export-ToCsv {
@@ -3616,6 +3764,21 @@ try {
     if ($choice -eq 'Q') {
         Write-Host "`n  Exiting." -ForegroundColor Red
         exit 0
+    }
+
+    $selectedWorkloadIds = if ($choice -eq 'A') {
+        @('1', '2', '3', '4', '5', '6', '7', '8')
+    }
+    else {
+        @($choice)
+    }
+    $modulePreflight = Invoke-ScannerModulePreflight -WorkloadIds $selectedWorkloadIds
+    if ($modulePreflight.Cancelled) {
+        Write-Host "`n  Scan cancelled before collection." -ForegroundColor Yellow
+        exit 0
+    }
+    if (@($modulePreflight.MissingModules).Count -gt 0) {
+        Write-Host "`n  Continuing with available modules; affected collectors may be unavailable or use fallbacks." -ForegroundColor Yellow
     }
 
     Show-Banner
