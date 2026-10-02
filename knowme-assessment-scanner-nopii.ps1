@@ -29,6 +29,10 @@
         Install-Module Microsoft.Online.SharePoint.PowerShell -Scope CurrentUser
       SharePoint Administrator role (delegated, interactive login)
       $tenantUrl configured in the Configuration section
+      For multi-geo SharePoint scans, $spoGeoAdminUrls must map every geography
+      (including the configured tenant URL's geography) to its actual admin URL.
+      Get-SPOGeoStorageQuota reports geography codes, not admin hostnames.
+      Incomplete scans are flagged in the log and consolidated site summary.
 
     Exchange Online [2] additionally requires:
       ExchangeOnlineManagement module  (Install-Module ExchangeOnlineManagement -Scope CurrentUser)
@@ -105,6 +109,16 @@ $tenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3'   # Tenant ID or verified dom
 
 # ---- Tenant root SharePoint URL (required for SharePoint workload PnP calls) ----
 $tenantUrl = 'https://m365cpi13246019.sharepoint.com'   # e.g. 'https://contoso.sharepoint.com'
+
+# ---- SharePoint GEO admin endpoints (leave empty for single-geo tenants) ----
+# Use actual admin URLs; do not derive hostnames from geography codes.
+# For the customer's NAM/GBR tenant, also set $tenantUrl to its tenant root:
+# $tenantUrl = 'https://contoso.sharepoint.com'
+# $spoGeoAdminUrls = @{
+#     NAM = 'https://contosojpn-admin.sharepoint.com'
+#     GBR = 'https://contosogbr-admin.sharepoint.com'
+# }
+$spoGeoAdminUrls = @{}
 
 # ---- Output folder for exported CSV files ----
 $OutputFolder = "$env:USERPROFILE\Documents\MCA_Assessment"
@@ -838,6 +852,34 @@ function Export-ToCsv {
 
 #region Workload: SharePoint Online
 
+function Get-ValidatedSpoGeoAdminUrls {
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.IDictionary] $Mappings)
+
+    $validated = @{}
+    $endpoints = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $Mappings.GetEnumerator()) {
+        $code = ([string]$entry.Key).Trim().ToUpperInvariant()
+        if ($code -notmatch '^[A-Z]{3}$') {
+            throw "Invalid SPO geography code '$($entry.Key)'. Use a three-letter code such as NAM or GBR."
+        }
+        if ($validated.ContainsKey($code)) {
+            throw "Duplicate SPO geography code '$code'."
+        }
+        if ($entry.Value -isnot [string]) {
+            throw "SPO admin URL for '$code' must be a string."
+        }
+        $url = $entry.Value.Trim().TrimEnd('/')
+        if ($url -notmatch '^https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-admin\.sharepoint\.com$') {
+            throw "Invalid SPO admin URL for '$code': '$url'. Use https://<tenant>-admin.sharepoint.com with no path, query, or fragment."
+        }
+        if (-not $endpoints.Add($url)) {
+            throw "SPO admin URL '$url' is mapped to more than one geography."
+        }
+        $validated[$code] = $url
+    }
+    return $validated
+}
+
 function Collect-SharePointData {
     Write-Log ""
     Write-Log "==  SharePoint Online  ==" 'SUCCESS'
@@ -848,12 +890,28 @@ function Collect-SharePointData {
     }
 
     $adminUrl = $tenantUrl.TrimEnd('/') -replace 'https://([^.]+)\.sharepoint\.com.*', 'https://$1-admin.sharepoint.com'
-    $tenantNamePart = (($tenantUrl -replace '^https?://', '') -split '\.')[0]
     $adminUrlsToScan = [System.Collections.Generic.List[string]]::new()
     $adminUrlsToScan.Add($adminUrl)
     Write-Log "  Connecting to SharePoint Online admin ($adminUrl)..."
 
     try {
+        $configuredGeoAdmins = Get-ValidatedSpoGeoAdminUrls -Mappings $spoGeoAdminUrls
+        $geoCodeMap = @{ $adminUrl = 'PRIMARY' }
+        foreach ($code in @($configuredGeoAdmins.Keys | Sort-Object)) {
+            $url = $configuredGeoAdmins[$code]
+            $geoCodeMap[$url] = $code
+            if ($adminUrlsToScan -notcontains $url) {
+                $adminUrlsToScan.Add($url)
+            }
+        }
+        if ($configuredGeoAdmins.Count -gt 0 -and $configuredGeoAdmins.Values -notcontains $adminUrl) {
+            throw 'The SPO GEO mapping must include the admin endpoint derived from $tenantUrl.'
+        }
+        $unresolvedGeos = [System.Collections.Generic.List[string]]::new()
+        $failedGeos = [System.Collections.Generic.List[string]]::new()
+        $scannedGeoCount = 0
+        $geoDiscoveryVerified = $false
+
         if ($PSVersionTable.PSVersion.Major -gt 5) {
             Import-Module Microsoft.Online.SharePoint.PowerShell `
                 -UseWindowsPowerShell -DisableNameChecking -ErrorAction Stop
@@ -866,12 +924,9 @@ function Collect-SharePointData {
         Connect-SPOService -Url $adminUrl -ErrorAction Stop
         Write-Log "  Connected to SharePoint Online admin." 'SUCCESS'
         
-        # Track that we're already connected to the primary admin URL
-        $activeGeoAdmins = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $null = $activeGeoAdmins.Add($adminUrl)
+        $currentGeoAdminUrl = $adminUrl
 
-        # Detect multi-geo using SPO module native cmdlets and build GEO admin URL list.
-        $geoCodeMap = @{ $adminUrl = 'PRIMARY' }
+        # Quota rows identify expected geographies; only configuration supplies endpoints.
         try {
             $geoQuotaRaw = @(Get-SPOGeoStorageQuota -AllLocations -ErrorAction Stop)
             if ($geoQuotaRaw.Count -gt 0) {
@@ -886,59 +941,56 @@ function Collect-SharePointData {
                 }
                 catch { Write-Log "  SPO geo storage quota export unavailable: $($_.Exception.Message)" 'WARN' }
 
-                $discoveredAdminUrls = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-                $geoCodeMap = @{}
+                $geoDiscoveryVerified = $true
+                $quotaGeoCodes = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
                 foreach ($geo in $geoQuotaRaw) {
-                    foreach ($prop in $geo.PSObject.Properties) {
-                        if ($prop.Value -is [string] -and $prop.Value -match '^https://[^/]+-admin\.sharepoint\.') {
-                            $null = $discoveredAdminUrls.Add($prop.Value.TrimEnd('/'))
-                        }
-                    }
-
                     $geoCode = $null
                     foreach ($locProp in @('GeoLocation', 'Location', 'DataLocation', 'PreferredDataLocation', 'AllowedDataLocation')) {
                         if ($geo.PSObject.Properties.Name -contains $locProp) {
                             $candidate = [string]$geo.$locProp
                             if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-                                $geoCode = $candidate.Trim()
+                                $geoCode = $candidate.Trim().ToUpperInvariant()
                                 break
                             }
                         }
                     }
 
-                    if (-not [string]::IsNullOrWhiteSpace($geoCode)) {
-                        if ($geoCode -notmatch '^(NAM|NA|DEFAULT|PRIMARY|HOME)$') {
-                            $satUrl1 = "https://{0}{1}-admin.sharepoint.com" -f $tenantNamePart, $geoCode.ToLowerInvariant()
-                            $satUrl2 = "https://{0}-{1}-admin.sharepoint.com" -f $tenantNamePart, $geoCode.ToLowerInvariant()
-                            $null = $discoveredAdminUrls.Add($satUrl1)
-                            $null = $discoveredAdminUrls.Add($satUrl2)
-                            $geoCodeMap[$satUrl1] = $geoCode.ToUpperInvariant()
-                            $geoCodeMap[$satUrl2] = $geoCode.ToUpperInvariant()
+                    if ([string]::IsNullOrWhiteSpace($geoCode)) {
+                        $geoDiscoveryVerified = $false
+                        Write-Log '  A GEO quota row has no geography code; scan coverage cannot be verified.' 'WARN'
+                    }
+                    else {
+                        $null = $quotaGeoCodes.Add($geoCode)
+                    }
+                }
+
+                foreach ($code in $quotaGeoCodes) {
+                    if (-not $configuredGeoAdmins.ContainsKey($code)) {
+                        if ($geoQuotaRaw.Count -eq 1 -and $configuredGeoAdmins.Count -eq 0) {
+                            $geoCodeMap[$adminUrl] = $code
                         }
                         else {
-                            $geoCodeMap[$adminUrl] = 'PRIMARY'
+                            $unresolvedGeos.Add($code)
+                            Write-Log "  No admin URL configured for GEO '$code'. Add it to `$spoGeoAdminUrls; no endpoint will be guessed." 'WARN'
                         }
                     }
                 }
 
-                foreach ($u in $discoveredAdminUrls) {
-                    if ($u -and -not ($adminUrlsToScan -contains $u)) {
-                        $adminUrlsToScan.Add($u)
-                    }
-                }
-
-                if ($adminUrlsToScan.Count -gt 1) {
-                    Write-Log "  Multi-geo detected. GEO admin endpoints to scan: $($adminUrlsToScan.Count)" 'SUCCESS'
+                if ($geoQuotaRaw.Count -gt 1) {
+                    Write-Log "  Multi-geo detected. Configured GEO admin endpoints to scan: $($adminUrlsToScan.Count); unresolved geographies: $($unresolvedGeos.Count)." 'INFO'
                 }
                 else {
-                    Write-Log "  Multi-geo endpoints not detected; scanning primary GEO only." 'DEBUG'
+                    Write-Log "  GEO admin endpoints to scan: $($adminUrlsToScan.Count)." 'DEBUG'
                 }
+            }
+            else {
+                Write-Log '  GEO quota discovery returned no rows; scan coverage cannot be verified.' 'WARN'
             }
         }
         catch {
-            Write-Log "  Multi-geo discovery unavailable. Scanning primary GEO only: $($_.Exception.Message)" 'WARN'
-            $geoCodeMap = @{ $adminUrl = 'PRIMARY' }
+            $geoDiscoveryVerified = $false
+            Write-Log "  Multi-geo discovery unavailable. Scanning the initial endpoint and any configured GEO endpoints; coverage is unverified: $($_.Exception.Message)" 'WARN'
         }
 
         # --- SharePoint site totals (single-geo or multi-geo via admin endpoint loop, per-geo output files) ---
@@ -949,13 +1001,14 @@ function Collect-SharePointData {
 
             foreach ($geoAdminUrl in $adminUrlsToScan) {
                 try {
-                    if (-not $activeGeoAdmins.Contains($geoAdminUrl)) {
-                        try { Disconnect-SPOService -ErrorAction SilentlyContinue } catch {}
+                    if ($currentGeoAdminUrl -ne $geoAdminUrl) {
+                        if ($currentGeoAdminUrl) { Disconnect-SPOService -ErrorAction Stop }
+                        $currentGeoAdminUrl = $null
                         Connect-SPOService -Url $geoAdminUrl -ErrorAction Stop
-                        $null = $activeGeoAdmins.Add($geoAdminUrl)
+                        $currentGeoAdminUrl = $geoAdminUrl
                     }
 
-                    $geoSites = @(Get-SPOSite -Limit All)
+                    $geoSites = @(Get-SPOSite -Limit All -ErrorAction Stop)
                     $geoSiteCount = @($geoSites).Count
                     $geoUsedMB = (@($geoSites) | Measure-Object -Property StorageUsageCurrent -Sum).Sum
 
@@ -995,25 +1048,36 @@ function Collect-SharePointData {
                     foreach ($site in $geoSites) {
                         $allSiteList.Add($site)
                     }
+                    $scannedGeoCount++
                 }
                 catch {
+                    $failedGeos.Add($geoCodeMap[$geoAdminUrl])
                     Write-Log "  GEO scan failed for ${geoAdminUrl}: $($_.Exception.Message)" 'WARN'
                 }
             }
 
-            $allSites = @($allSiteList)
+            $allSites = $allSiteList.ToArray()
             $siteCount = @($allSites).Count
-            $totalUsedMB = (@($allSites) | Measure-Object -Property StorageUsageCurrent -Sum).Sum
-            Write-Log "  SPO total sites across all GEOs: $siteCount" 'SUCCESS'
+            $totalUsedMB = [double](@($allSites) | Measure-Object -Property StorageUsageCurrent -Sum).Sum
+            $geoScanStatus = if ($unresolvedGeos.Count -gt 0 -or $failedGeos.Count -gt 0) { 'Partial' } elseif (-not $geoDiscoveryVerified) { 'Unverified' } else { 'Complete' }
+            if ($geoScanStatus -eq 'Complete') {
+                Write-Log "  SPO total sites across all GEOs: $siteCount" 'SUCCESS'
+            }
+            else {
+                Write-Log "  SPO site totals ($geoScanStatus coverage): $siteCount sites from $scannedGeoCount scanned endpoint(s). Unresolved GEOs: $($unresolvedGeos -join ', '); failed GEOs: $($failedGeos -join ', ')." 'WARN'
+            }
 
             # Reconnect to the primary admin endpoint for tenant-level settings cmdlets only if multi-geo was detected.
             if ($multiGeoDetected) {
                 try {
-                    Disconnect-SPOService -ErrorAction SilentlyContinue
+                    if ($currentGeoAdminUrl) { Disconnect-SPOService -ErrorAction Stop }
+                    $currentGeoAdminUrl = $null
                     Connect-SPOService -Url $adminUrl -ErrorAction Stop
+                    $currentGeoAdminUrl = $adminUrl
                 }
                 catch {
                     Write-Log "  Could not reconnect to primary admin endpoint before tenant settings collection: $($_.Exception.Message)" 'WARN'
+                    return
                 }
             }
         }
@@ -1021,6 +1085,7 @@ function Collect-SharePointData {
             $allSites = @()
             $siteCount = 0
             $totalUsedMB = 0
+            $geoScanStatus = 'Partial'
             Write-Log "  SPO site totals failed: $($_.Exception.Message)" 'WARN'
         }
 
@@ -1033,9 +1098,9 @@ function Collect-SharePointData {
             try {
                 Write-Log "  SPO tenant storage pool summary..."
 
-                $sitesForSummary = if ($allSites) { @($allSites) } else { @(Get-SPOSite -Limit All) }
+                $sitesForSummary = @($allSites)
                 $siteCount = $sitesForSummary.Count
-                $totalUsedMB = ($sitesForSummary | Measure-Object -Property StorageUsageCurrent -Sum).Sum
+                $totalUsedMB = [double]($sitesForSummary | Measure-Object -Property StorageUsageCurrent -Sum).Sum
                 $tenantPoolMB = [double]$spoTenant.StorageQuota
                 $allocatedMB = [double]$spoTenant.StorageQuotaAllocated
                 $allocatedIsReported = ($allocatedMB -gt 0)
@@ -1055,13 +1120,17 @@ function Collect-SharePointData {
                         AvgStorageUsedPerSiteGB   = if ($siteCount -gt 0) { [math]::Round((($totalUsedMB / $siteCount) / 1024), 4) } else { 0 }
                         UsedOfTenantPoolDisplay   = ("{0} MB used of {1} TB" -f [math]::Round($totalUsedMB, 2), [math]::Round(($tenantPoolMB / 1024 / 1024), 2))
                         StorageAllocationModeNote = if (-not $allocatedIsReported) { 'StorageQuotaAllocated returned 0 (common with automatic storage management).' } else { '' }
+                        GeoScanStatus             = $geoScanStatus
+                        ScannedGeoCount           = $scannedGeoCount
+                        UnresolvedGeographies     = $unresolvedGeos -join ';'
+                        FailedGeographies         = $failedGeos -join ';'
                         CollectDate               = (Get-Date -Format 'yyyy-MM-dd HH:mm')
                     })
 
                 Export-ToCsv -Data $spoSummary -FileName "SPO_SiteSummary_$date.csv"
                 Write-Log ("  SPO storage: " +
                     "$($spoSummary[0].TotalStorageUsedMB) MB used of $($spoSummary[0].TenantStoragePoolTB) TB " +
-                    "($($spoSummary[0].PercentTenantPoolUsed)% used)") 'SUCCESS'
+                    "($($spoSummary[0].PercentTenantPoolUsed)% used); GEO coverage: $geoScanStatus") $(if ($geoScanStatus -eq 'Complete') { 'SUCCESS' } else { 'WARN' })
             }
             catch { Write-Log "  SPO tenant storage summary unavailable: $($_.Exception.Message)" 'WARN' }
 
@@ -1477,12 +1546,18 @@ function Collect-SharePointData {
     }
     catch {
         Write-Log "  SharePoint Online connection failed: $($_.Exception.Message)" 'ERROR'
+        return
     }
     finally {
         try { Disconnect-SPOService -ErrorAction SilentlyContinue } catch {}
     }
 
-    Write-Log "  SharePoint Online collection complete." 'SUCCESS'
+    if ($geoScanStatus -eq 'Complete') {
+        Write-Log "  SharePoint Online collection complete." 'SUCCESS'
+    }
+    else {
+        Write-Log "  SharePoint Online collection finished with $geoScanStatus GEO coverage; consolidated site totals are not verified tenant-wide totals." 'WARN'
+    }
 }
 
 #endregion
