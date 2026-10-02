@@ -12,6 +12,11 @@
     workloads.  Missing modules can be installed for the current user, or the
     administrator can continue with affected collectors unavailable/fallback-only.
     The scanner never installs modules without an explicit choice.
+    Windows PowerShell 5.1, including ISE, is supported for the native-module
+    collectors. Graph-dependent collectors are more reliable in PowerShell 7;
+    ISE/PowerShell 5.1 displays a workload-specific compatibility warning.
+    Graph authentication and basic tenant-read access are checked before
+    Graph-dependent collection.
 
     AUTHENTICATION:
       SharePoint Online [1] and OneDrive for Business [4] use the
@@ -41,19 +46,19 @@
 
     Exchange Online [2] additionally requires:
       ExchangeOnlineManagement module  (Install-Module ExchangeOnlineManagement -Scope CurrentUser)
-      Azure AD application permission 'Exchange.ManageAsApp' (grant + admin consent)
-      Service principal assigned 'Exchange Administrator' or 'Exchange Recipient Administrator'
-      role in Entra ID > Roles and administrators.
+      The signed-in user must have 'Exchange Administrator',
+      'Exchange Recipient Administrator', or equivalent Exchange RBAC access.
+      This scanner uses delegated interactive authentication, not app-only auth.
 
     Microsoft Teams [3] additionally requires:
       MicrosoftTeams module  (Install-Module MicrosoftTeams -Scope CurrentUser)
-      Service principal assigned 'Teams Administrator' or 'Global Reader' role
-      in Entra ID > Roles and administrators.
+      The signed-in user must have 'Teams Administrator', 'Global Reader', or
+      equivalent access for the requested Teams admin cmdlets.
 
     Security & Compliance [6] additionally requires:
       ExchangeOnlineManagement module  (Install-Module ExchangeOnlineManagement -Scope CurrentUser)
-      Service principal assigned 'Compliance Administrator' or equivalent role
-      for Connect-IPPSSession based collection.
+      The signed-in user must have 'Compliance Administrator' or equivalent
+      Security & Compliance role access for Connect-IPPSSession based collection.
 
     Entra ID [5] / Graph-backed report and security fallback data require:
       Directory.Read.All, Reports.Read.All, Policy.Read.All,
@@ -76,17 +81,20 @@
 function Start-ScannerInCleanPwshIfNeeded {
     <#
     .SYNOPSIS
-        Relaunches this script in a clean PowerShell 7 host when running from
-        Windows PowerShell or VS Code-integrated hosts, which often preload
-        assemblies that conflict with MicrosoftTeams/Microsoft.Graph auth stacks.
+        Relaunches in clean PowerShell 7 for integrated hosts or sessions with
+        authentication assemblies already loaded. ISE remains in its native host.
     #>
     if ($env:MCA_SCANNER_ISOLATED -eq '1') { return }
 
+    $isIseHost = ($Host.Name -match 'PowerShell ISE') -or ($null -ne $psISE)
     $isVsCodeHost = ($Host.Name -match 'Visual Studio Code') -or ($env:TERM_PROGRAM -eq 'vscode')
+    if ($isIseHost) { return }
 
-    # Keep Windows PowerShell 5.1 native; only isolate PowerShell 7 sessions
-    # that are running inside an integrated host.
-    if ($PSVersionTable.PSEdition -ne 'Core' -or -not $isVsCodeHost) { return }
+    if ($PSVersionTable.PSEdition -ne 'Core') { return }
+    $hasLoadedAuthAssemblies = @([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object {
+            $_.GetName().Name -in @('Microsoft.Identity.Client', 'Microsoft.IdentityModel.Abstractions', 'Azure.Identity', 'Microsoft.Graph.Authentication.Core')
+        }).Count -gt 0
+    if (-not $isVsCodeHost -and -not $hasLoadedAuthAssemblies) { return }
 
     $pwsh = Get-Command -Name 'pwsh' -ErrorAction SilentlyContinue
     if (-not $pwsh) {
@@ -94,13 +102,22 @@ function Start-ScannerInCleanPwshIfNeeded {
         return
     }
 
-    if (-not $PSCommandPath) { return }
+    if (-not $PSCommandPath) {
+        throw 'The scanner cannot relaunch because its script path is unavailable. Save the script to a .ps1 file and run that file from PowerShell 7.'
+    }
 
-    Write-Host 'Relaunching MCA scanner in clean PowerShell 7 process (-NoProfile) to avoid module assembly conflicts...' -ForegroundColor Yellow
+    Write-Host 'Relaunching MCA scanner in a clean PowerShell 7 process (-NoProfile) to avoid authentication-module conflicts...' -ForegroundColor Yellow
 
-    $env:MCA_SCANNER_ISOLATED = '1'
-    & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
-    exit $LASTEXITCODE
+    $previousIsolationFlag = $env:MCA_SCANNER_ISOLATED
+    try {
+        $env:MCA_SCANNER_ISOLATED = '1'
+        & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
+        $scannerExitCode = $LASTEXITCODE
+    }
+    finally {
+        $env:MCA_SCANNER_ISOLATED = $previousIsolationFlag
+    }
+    exit $scannerExitCode
 }
 
 Start-ScannerInCleanPwshIfNeeded
@@ -216,27 +233,6 @@ function Write-Log {
     }
 }
 
-function Initialize-ModuleCompatibility {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [bool] $NeedsTeamsCompatibility
-    )
-
-    if (-not $NeedsTeamsCompatibility) { return }
-
-    # Pre-import Teams only when needed. This keeps Entra-only runs from loading
-    # auth assemblies that can conflict with Microsoft.Graph authentication.
-    if (Get-Module -ListAvailable -Name 'MicrosoftTeams') {
-        try {
-            Import-Module MicrosoftTeams -ErrorAction Stop
-            Write-Log '  Module compatibility: preloaded MicrosoftTeams for Teams workload.' 'DEBUG'
-        }
-        catch {
-            Write-Log "  Module compatibility preload warning (MicrosoftTeams): $($_.Exception.Message)" 'WARN'
-        }
-    }
-}
 #endregion Initialization
 
 #region Graph Helper Functions
@@ -351,6 +347,8 @@ $script:exchangeOnlineConnected = $false
 $script:securityComplianceConnected = $false
 $script:spoConnected = $false
 $script:spoAdminUrl = $null
+$script:graphAuthUnavailable = $false
+$script:graphAuthFailureMessage = $null
 
 function Connect-ToMicrosoftGraph {
     <#
@@ -358,12 +356,25 @@ function Connect-ToMicrosoftGraph {
         Connects to Microsoft Graph using interactive (delegated) authentication.
         Requires: Install-Module Microsoft.Graph -Scope CurrentUser
     #>
+    if ($script:graphAuthUnavailable) {
+        throw 'Microsoft Graph authentication is unavailable for this run; Graph-backed requests are being skipped.'
+    }
+
     Write-Log "Connecting to Microsoft Graph (interactive)..."
 
     if (-not (Get-Module -ListAvailable -Name 'Microsoft.Graph.Authentication')) {
+        $script:graphAuthUnavailable = $true
+        $script:graphAuthFailureMessage = 'Microsoft.Graph.Authentication is not installed.'
         throw "Microsoft.Graph.Authentication module not found.`n  Install with: Install-Module Microsoft.Graph -Scope CurrentUser"
     }
-    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    try {
+        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    }
+    catch {
+        $script:graphAuthUnavailable = $true
+        $script:graphAuthFailureMessage = $_.Exception.Message
+        throw
+    }
 
     $scopes = @(
         'Directory.Read.All',
@@ -394,31 +405,50 @@ function Connect-ToMicrosoftGraph {
         $isKnownMsalAssemblyConflict = $msg -match 'Method not found' -and
         $msg -match 'BaseAbstractApplicationBuilder`1\.WithLogging' -and
         $msg -match '(Microsoft\.Identity\.Client|Microsoft\.IdentityModel\.Abstractions)'
+        $isGraphCacheAssemblyConflict = $msg -match '(?i)RefreshCacheAsync'
+        $isWamRuntimeFailure = $msg -match '(?i)msalruntime'
 
-        if ($isKnownMsalAssemblyConflict) {
-            Write-Log '  Graph interactive browser auth failed due to a known MSAL assembly conflict in the current host.' 'WARN'
-            Write-Log '  Retrying Graph auth using device code flow (bypasses browser-credential path)...' 'WARN'
+        if ($isKnownMsalAssemblyConflict -or $isGraphCacheAssemblyConflict) {
+            $script:graphAuthUnavailable = $true
+            $script:graphAuthFailureMessage = $msg
+            Write-Log '  Graph authentication stopped because the loaded Graph/MSAL assemblies are incompatible; changing sign-in flow will not repair this binary mismatch.' 'ERROR'
+            Write-Log '  Start a fresh pwsh -NoProfile process and run the scanner before importing Teams, Exchange, or other authentication modules.' 'WARN'
+            throw
+        }
+        elseif ($isWamRuntimeFailure) {
+            Write-Log '  Graph interactive authentication failed because the WAM runtime is unavailable.' 'WARN'
+            Write-Log '  Retrying once with device-code authentication...' 'WARN'
 
             try {
                 Connect-MgGraph -TenantId $tenantId -Scopes $scopes -UseDeviceAuthentication -NoWelcome -ErrorAction Stop
             }
             catch {
+                $script:graphAuthUnavailable = $true
+                $script:graphAuthFailureMessage = $_.Exception.Message
                 Write-Log '  Device code fallback also failed. Recommended remediation:' 'WARN'
-                Write-Log '    1) Close all PowerShell hosts and re-run using: pwsh -NoProfile -File "<path-to-this-script>"' 'WARN'
-                Write-Log '    2) Update modules (CurrentUser): Microsoft.Graph and MicrosoftTeams' 'WARN'
+                Write-Log '    1) Run the scanner in PowerShell 7 using: pwsh -NoProfile -File "<path-to-this-script>"' 'WARN'
+                Write-Log '    2) Update Microsoft.Graph.Authentication for the current user.' 'WARN'
                 throw
             }
         }
         else {
+            $script:graphAuthUnavailable = $true
+            $script:graphAuthFailureMessage = $msg
             throw
         }
     }
 
     $global:mgConnected = $true
+    $script:graphAuthUnavailable = $false
+    $script:graphAuthFailureMessage = $null
     Write-Log "  Connected to Microsoft Graph (interactive delegated auth)" 'SUCCESS'
 }
 
 function Test-ValidToken {
+    if ($script:graphAuthUnavailable) {
+        throw 'Microsoft Graph authentication/access preflight failed; Graph-backed requests are disabled for this run.'
+    }
+
     if (-not $global:mgConnected) {
         Connect-ToMicrosoftGraph
         return
@@ -429,6 +459,30 @@ function Test-ValidToken {
         $global:mgConnected = $false
         Connect-ToMicrosoftGraph
     }
+}
+
+function Test-MicrosoftGraphPreflight {
+    Test-ValidToken
+    $null = Invoke-MgGraphRequest `
+        -Uri 'https://graph.microsoft.com/v1.0/organization?$select=id' `
+        -Method GET `
+        -OutputType PSObject `
+        -ErrorAction Stop
+}
+
+function Connect-ToSharePointAdmin {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Url)
+
+    $connectCommand = Get-Command -Name 'Connect-SPOService' -ErrorAction Stop
+    $connectParams = @{
+        Url         = $Url
+        ErrorAction = 'Stop'
+    }
+    if ($connectCommand.Parameters.ContainsKey('UseSystemBrowser')) {
+        $connectParams['UseSystemBrowser'] = $true
+    }
+    Connect-SPOService @connectParams
 }
 
 function Disconnect-WorkloadSessions {
@@ -538,7 +592,15 @@ function Connect-ToMicrosoftTeams {
     # Force a delegated user sign-in with the native Teams module.
     # Do not use app-only/certificate parameters for this workload.
     try { Disconnect-MicrosoftTeams -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
-    Connect-MicrosoftTeams -TenantId $tenantId -ErrorAction Stop
+    $connectCommand = Get-Command -Name 'Connect-MicrosoftTeams' -ErrorAction Stop
+    $connectParams = @{
+        TenantId    = $tenantId
+        ErrorAction = 'Stop'
+    }
+    if ($connectCommand.Parameters.ContainsKey('DisableWAM')) {
+        $connectParams['DisableWAM'] = $true
+    }
+    Connect-MicrosoftTeams @connectParams
     Write-Log "  Connected to MicrosoftTeams module (interactive delegated auth)" 'SUCCESS'
 }
 
@@ -663,7 +725,15 @@ function Connect-ToExchangeOnline {
     }
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
-    Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+    $connectCommand = Get-Command -Name 'Connect-ExchangeOnline' -ErrorAction Stop
+    $connectParams = @{
+        ShowBanner  = $false
+        ErrorAction = 'Stop'
+    }
+    if ($connectCommand.Parameters.ContainsKey('DisableWAM')) {
+        $connectParams['DisableWAM'] = $true
+    }
+    Connect-ExchangeOnline @connectParams
     $script:exchangeOnlineConnected = $true
     Write-Log "  Connected to Exchange Online (interactive delegated auth)" 'SUCCESS'
 }
@@ -685,7 +755,15 @@ function Connect-ToSecurityCompliance {
     }
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
 
-    Connect-IPPSSession -ShowBanner:$false -ErrorAction Stop
+    $connectCommand = Get-Command -Name 'Connect-IPPSSession' -ErrorAction Stop
+    $connectParams = @{
+        ShowBanner  = $false
+        ErrorAction = 'Stop'
+    }
+    if ($connectCommand.Parameters.ContainsKey('DisableWAM')) {
+        $connectParams['DisableWAM'] = $true
+    }
+    Connect-IPPSSession @connectParams
     $script:securityComplianceConnected = $true
     Write-Log "  Connected to Security & Compliance PowerShell (interactive delegated auth)" 'SUCCESS'
 }
@@ -759,7 +837,7 @@ function Connect-ToPowerPlatformAdmin {
 function Get-PowerPlatformEnvironmentsIsolated {
     <#
     .SYNOPSIS
-        Collects Power Platform environments in a separate pwsh -NoProfile process
+        Collects Power Platform environments in a separate PowerShell process
         to avoid in-process Microsoft.Identity.Client assembly conflicts.
     #>
     [CmdletBinding()]
@@ -1089,7 +1167,7 @@ function Collect-SharePointData {
                 -DisableNameChecking -ErrorAction Stop
         }
 
-        Connect-SPOService -Url $adminUrl -ErrorAction Stop
+        Connect-ToSharePointAdmin -Url $adminUrl
         Write-Log "  Connected to SharePoint Online admin." 'SUCCESS'
         
         $currentGeoAdminUrl = $adminUrl
@@ -1172,7 +1250,7 @@ function Collect-SharePointData {
                     if ($currentGeoAdminUrl -ne $geoAdminUrl) {
                         if ($currentGeoAdminUrl) { Disconnect-SPOService -ErrorAction Stop }
                         $currentGeoAdminUrl = $null
-                        Connect-SPOService -Url $geoAdminUrl -ErrorAction Stop
+                        Connect-ToSharePointAdmin -Url $geoAdminUrl
                         $currentGeoAdminUrl = $geoAdminUrl
                     }
 
@@ -1240,7 +1318,7 @@ function Collect-SharePointData {
                 try {
                     if ($currentGeoAdminUrl) { Disconnect-SPOService -ErrorAction Stop }
                     $currentGeoAdminUrl = $null
-                    Connect-SPOService -Url $adminUrl -ErrorAction Stop
+                    Connect-ToSharePointAdmin -Url $adminUrl
                     $currentGeoAdminUrl = $adminUrl
                 }
                 catch {
@@ -2352,7 +2430,7 @@ function Collect-OneDriveData {
             Import-Module Microsoft.Online.SharePoint.PowerShell `
                 -DisableNameChecking -ErrorAction Stop
         }
-        Connect-SPOService -Url $adminUrl -ErrorAction Stop
+        Connect-ToSharePointAdmin -Url $adminUrl
         $script:spoConnected = $true
         $script:spoAdminUrl = $adminUrl
         Write-Log "  Connected to SharePoint Online admin." 'SUCCESS'
@@ -3666,7 +3744,7 @@ function Collect-InformationBarriersData {
                 }
 
                 Write-Log "  Connecting to SharePoint Online admin ($adminUrl)..."
-                Connect-SPOService -Url $adminUrl -ErrorAction Stop
+                Connect-ToSharePointAdmin -Url $adminUrl
                 $spoConnected = $true
                 $script:spoConnected = $true
                 $script:spoAdminUrl = $adminUrl
@@ -3754,6 +3832,10 @@ function Write-SummaryReport {
 ##############################################################
 
 try {
+    if ($PSVersionTable.PSVersion -lt [version]'5.1') {
+        throw 'PowerShell 5.1 or later is required. Windows PowerShell 5.0 is not supported by the Microsoft Graph SDK used by this scanner.'
+    }
+
     # Always require tenantId and tenantUrl
     if ([string]::IsNullOrWhiteSpace($tenantId)) { throw 'TenantId is empty. Fill in the Configuration section.' }
     if ([string]::IsNullOrWhiteSpace($tenantUrl)) { throw 'tenantUrl is empty. Fill in the Configuration section.' }
@@ -3772,6 +3854,33 @@ try {
     else {
         @($choice)
     }
+
+    if ($PSVersionTable.PSVersion.Major -eq 5) {
+        Write-Host "`n  Windows PowerShell 5.1 compatibility notice" -ForegroundColor Yellow
+        Write-Host "  Native PowerShell collectors can run in Windows PowerShell/ISE, but Graph SDK authentication has known ISE/MSAL assembly risks." -ForegroundColor DarkGray
+
+        $graphAffectedWorkloads = @($selectedWorkloadIds | Where-Object { $_ -in @('2', '3', '5', '6') })
+        if ($graphAffectedWorkloads.Count -gt 0) {
+            Write-Host "  If Graph preflight fails, these Graph-backed data areas will be unavailable:" -ForegroundColor Yellow
+            if ($graphAffectedWorkloads -contains '2') {
+                Write-Host "    Exchange: mailbox usage summary and Graph reports; native Exchange configuration collectors can still run." -ForegroundColor White
+            }
+            if ($graphAffectedWorkloads -contains '3') {
+                Write-Host "    Teams: Graph usage reports; MicrosoftTeams native policy/configuration collectors can still run." -ForegroundColor White
+            }
+            if ($graphAffectedWorkloads -contains '5') {
+                Write-Host "    Entra ID: the workload is Graph-backed and will be unavailable." -ForegroundColor White
+            }
+            if ($graphAffectedWorkloads -contains '6') {
+                Write-Host "    Security: Graph-backed Secure Score, Conditional Access, Intune, PIM, app-consent, and related collectors; Compliance PowerShell collectors can still run." -ForegroundColor White
+            }
+        }
+        if ($selectedWorkloadIds -contains '7') {
+            Write-Host "  Power Platform environment collection runs in a separate Windows PowerShell process and may require a second sign-in." -ForegroundColor White
+        }
+        Write-Host "  These are compatibility risks, not guaranteed failures. The Graph preflight will let you quit before collection or continue with native collectors." -ForegroundColor DarkGray
+    }
+
     $modulePreflight = Invoke-ScannerModulePreflight -WorkloadIds $selectedWorkloadIds
     if ($modulePreflight.Cancelled) {
         Write-Host "`n  Scan cancelled before collection." -ForegroundColor Yellow
@@ -3779,6 +3888,40 @@ try {
     }
     if (@($modulePreflight.MissingModules).Count -gt 0) {
         Write-Host "`n  Continuing with available modules; affected collectors may be unavailable or use fallbacks." -ForegroundColor Yellow
+    }
+
+    $accessRequirements = [System.Collections.Generic.List[string]]::new()
+    if (@($selectedWorkloadIds | Where-Object { $_ -in @('1', '4', '8') }).Count -gt 0) {
+        $accessRequirements.Add('SharePoint Administrator or equivalent SharePoint admin access')
+    }
+    if (@($selectedWorkloadIds | Where-Object { $_ -in @('2', '8') }).Count -gt 0) {
+        $accessRequirements.Add('Exchange Administrator, Exchange Recipient Administrator, or equivalent Exchange RBAC access')
+    }
+    if ($selectedWorkloadIds -contains '3') {
+        $accessRequirements.Add('Teams Administrator, Global Reader, or equivalent Teams admin access')
+    }
+    if (@($selectedWorkloadIds | Where-Object { $_ -in @('2', '3', '5', '6') }).Count -gt 0) {
+        $accessRequirements.Add('Admin-consented Microsoft Graph delegated scopes listed in the script header')
+    }
+    if ($selectedWorkloadIds -contains '6') {
+        $accessRequirements.Add('Compliance Administrator or equivalent Security & Compliance role access')
+    }
+    if ($selectedWorkloadIds -contains '7') {
+        $accessRequirements.Add('Power BI/Power Platform administrative access and required tenant API settings')
+    }
+
+    Write-Host "`n  Confirm tenant access before scanning:" -ForegroundColor Yellow
+    Write-Host "  Installing modules only adds local commands; it does not grant tenant roles or Graph consent." -ForegroundColor DarkGray
+    foreach ($requirement in $accessRequirements) {
+        Write-Host "    - $requirement" -ForegroundColor White
+    }
+    Write-Host "  If you are signed in as a standard user without these permissions, choose N to stop." -ForegroundColor DarkGray
+    do {
+        $accessChoice = (Read-Host "  Does the account you will use have the required access? [Y/N]").Trim().ToUpperInvariant()
+    } while ($accessChoice -notin @('Y', 'N'))
+    if ($accessChoice -eq 'N') {
+        Write-Host "`n  Scan cancelled before collection." -ForegroundColor Yellow
+        exit 0
     }
 
     Show-Banner
@@ -3789,8 +3932,35 @@ try {
 
     $runAll = ($choice -eq 'A')
     $script:keepWorkloadSessions = $runAll
-    $needsTeamsCompatibility = ($runAll -or $choice -eq '3')
-    Initialize-ModuleCompatibility -NeedsTeamsCompatibility $needsTeamsCompatibility
+
+    # Initialize Graph before native modules can load conflicting MSAL assemblies.
+    $graphWorkloadIds = @('2', '3', '5', '6')
+    $graphPreflightRequired = @($selectedWorkloadIds | Where-Object { $_ -in $graphWorkloadIds }).Count -gt 0
+    if ($graphPreflightRequired) {
+        Write-Host "`n  Checking Microsoft Graph sign-in and basic tenant read access before collection..." -ForegroundColor Cyan
+        try {
+            Test-MicrosoftGraphPreflight
+            Write-Log 'Microsoft Graph authentication/access preflight succeeded.' 'SUCCESS'
+        }
+        catch {
+            $script:graphAuthUnavailable = $true
+            $script:graphAuthFailureMessage = $_.Exception.Message
+            $global:mgConnected = $false
+            Write-Log "Microsoft Graph preflight failed before collection: $($_.Exception.Message)" 'ERROR'
+            Write-Host "`n  Graph-backed collection cannot run: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  This may be a PowerShell/MSAL runtime problem, missing delegated consent, or insufficient Graph access." -ForegroundColor Yellow
+            Write-Host "  [C] Continue with native-module collectors; Graph-backed data will be unavailable" -ForegroundColor White
+            Write-Host "  [Q] Quit without collecting data" -ForegroundColor Red
+            do {
+                $graphChoice = (Read-Host "  Choose").Trim().ToUpperInvariant()
+            } while ($graphChoice -notin @('C', 'Q'))
+
+            if ($graphChoice -eq 'Q') {
+                Write-Host "`n  Scan cancelled before collection." -ForegroundColor Yellow
+                exit 0
+            }
+        }
+    }
 
     $completed = [System.Collections.Generic.List[string]]::new()
 
