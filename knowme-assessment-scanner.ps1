@@ -54,6 +54,8 @@
       Directory.Read.All, Reports.Read.All, Policy.Read.All,
             SecurityEvents.Read.All, InformationProtectionPolicy.Read,
       AuditLog.Read.All
+      Microsoft.Graph.Reports module for the Exchange mailbox usage summary
+        Install-Module Microsoft.Graph.Reports -Scope CurrentUser
 
     Power Platform [7] additionally requires:
       'Power BI Service' Tenant.Read.All application permission
@@ -62,6 +64,8 @@
 .NOTES
     Author : Mike Lee
     Version: 4.0
+    Mailbox usage summary uses the Microsoft.Graph.Reports module and a D30
+    usage report; report values can lag live Exchange mailbox statistics.
 #>
 
 function Start-ScannerInCleanPwshIfNeeded {
@@ -151,7 +155,7 @@ $RunLog = Join-Path $OutputFolder "MCA_Scan_$date.log"
 function Test-PiiPropertyName {
     param([Parameter(Mandatory)] [string] $PropertyName)
 
-    return $PropertyName -match '(?i)(user|group|principal|identity|display.?name|name|mail|email|smtp|recipient|sender|address|ip|phone|mobile|upn|alias|owner|created.?by|modified.?by|lastmodified.?by|notify|actor|target|correlation|audit|object|tenant|domain|url|guid|id|include|exclude|member|account|login|sign.?in|admin)'
+    return $PropertyName -match '(?i)(user|group|principal|identity|display.?name|name|mail|email|smtp|recipient|sender|address|ip|phone|mobile|upn|alias|owner|created.?by|modified.?by|lastmodified.?by|initiated.?by|performed.?by|notify|actor|target|correlation|audit|object|tenant|domain|url|guid|id|include|exclude|member|account|login|sign.?in|admin)'
 }
 
 function Remove-PiiFromText {
@@ -162,9 +166,16 @@ function Remove-PiiFromText {
     $text = $text -replace '(?i)\bhttps?://[^\s"''<>?]+\?(?:[^\s"''<>]*&)?sig=[^\s"''<>]*', '[REDACTED]'
     $text = $text -replace '(?i)\bSharedAccessSignature=[^\s"'']+', 'SharedAccessSignature=[REDACTED]'
     $text = $text -replace '(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', '[REDACTED]'
-    $text = $text -replace '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b', '[REDACTED]'
+    $text = $text -replace '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b', '[REDACTED]'
     $text = $text -replace '\b(?:\d{1,3}\.){3}\d{1,3}\b', '[REDACTED]'
     return $text
+}
+
+function Remove-UrlsFromText {
+    param([AllowNull()] [object] $Value)
+
+    if ($null -eq $Value) { return '' }
+    return ([string]$Value) -replace '(?i)\bhttps?://[^\s"''<>]+', '[REDACTED_URL]'
 }
 
 function Remove-PiiFromExportRow {
@@ -333,6 +344,8 @@ function Invoke-GraphReportRequest {
 $global:mgConnected = $false
 $script:exchangeOnlineConnected = $false
 $script:securityComplianceConnected = $false
+$script:spoConnected = $false
+$script:spoAdminUrl = $null
 
 function Connect-ToMicrosoftGraph {
     <#
@@ -418,6 +431,11 @@ function Disconnect-WorkloadSessions {
         try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
         $script:exchangeOnlineConnected = $false
         $script:securityComplianceConnected = $false
+    }
+    if ($script:spoConnected) {
+        try { Disconnect-SPOService -ErrorAction SilentlyContinue } catch {}
+        $script:spoConnected = $false
+        $script:spoAdminUrl = $null
     }
 }
 
@@ -1531,6 +1549,7 @@ function Collect-SharePointData {
                 elseif ($val -is [System.Collections.IEnumerable] -and $val -isnot [string]) {
                     $val = ($val -join ', ')
                 }
+                $val = Remove-UrlsFromText -Value $val
                 [PSCustomObject]@{
                     Property    = $propName
                     Value       = $val
@@ -1635,31 +1654,43 @@ function Collect-ExchangeData {
 
             # ---- Mailbox and group inventory ---------------------------------------------
             try {
-                Write-Log "  Mailbox usage detail (Get-EXOMailboxStatistics)..."
-                $mailboxes = @(Get-EXOMailbox -ResultSize Unlimited -PropertySets Minimum *>&1 |
-                    Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] -and $null -ne $_ -and $_ -isnot [string] })
-                $mailboxCount = 0
-                $mailboxStatsFailed = 0
-                $totalMailboxBytes = 0L
-                $totalMailboxItems = 0L
-                $totalDeletedItems = 0L
-                foreach ($mbx in $mailboxes) {
-                    try {
-                        $stats = Get-EXOMailboxStatistics -Identity $mbx.UserPrincipalName -ErrorAction Stop
-                        $mailboxCount++
-                        $totalMailboxBytes += ConvertTo-ByteCount -Value $stats.TotalItemSize
-                        $totalMailboxItems += [int64]$stats.ItemCount
-                        $totalDeletedItems += [int64]$stats.DeletedItemCount
+                Write-Log "  Mailbox usage summary (Get-MgReportMailboxUsageDetail, D30)..."
+                Test-ValidToken
+                Import-Module Microsoft.Graph.Reports -ErrorAction Stop
+                $tempPath = Join-Path ([System.IO.Path]::GetTempPath()) ("mca_mailbox_usage_{0}_{1}.csv" -f $PID, [Guid]::NewGuid().ToString('N'))
+                try {
+                    Get-MgReportMailboxUsageDetail -Period 'D30' -OutFile $tempPath -ErrorAction Stop | Out-Null
+                    if (-not (Test-Path -LiteralPath $tempPath -PathType Leaf)) {
+                        throw 'The mailbox usage report command completed without creating its output file.'
                     }
-                    catch {
-                        $mailboxStatsFailed++
-                        Write-Log "  Mailbox statistics unavailable for one mailbox: $($_.Exception.Message)" 'DEBUG'
+
+                    $usageRows = @(Import-Csv -LiteralPath $tempPath -Encoding UTF8 -ErrorAction Stop)
+                    if ($usageRows.Count -eq 0) {
+                        throw 'The mailbox usage report returned no rows.'
                     }
-                }
-                $mailboxSummary = @([PSCustomObject]@{
+
+                    $reportColumns = @($usageRows[0].PSObject.Properties.Name)
+                    foreach ($requiredColumn in @('Item Count', 'Storage Used (Byte)', 'Deleted Item Count')) {
+                        if ($requiredColumn -notin $reportColumns) {
+                            throw "The mailbox usage report is missing the required '$requiredColumn' column."
+                        }
+                    }
+
+                    $mailboxCount = $usageRows.Count
+                    $reportRefreshDate = [string]$usageRows[0].'Report Refresh Date'
+                    $totalMailboxBytes = 0L
+                    $totalMailboxItems = 0L
+                    $totalDeletedItems = 0L
+                    foreach ($usageRow in $usageRows) {
+                        $totalMailboxBytes += [int64](($usageRow.'Storage Used (Byte)' -replace '[,\s]', ''))
+                        $totalMailboxItems += [int64](($usageRow.'Item Count' -replace '[,\s]', ''))
+                        $totalDeletedItems += [int64](($usageRow.'Deleted Item Count' -replace '[,\s]', ''))
+                    }
+
+                    $mailboxSummary = @([PSCustomObject]@{
                         ObjectType                 = 'Mailbox'
                         ObjectCount                = $mailboxCount
-                        StatisticsFailures         = $mailboxStatsFailed
+                        StatisticsFailures         = ''
                         TotalItemCount             = $totalMailboxItems
                         TotalDeletedItemCount      = $totalDeletedItems
                         TotalMailboxSizeBytes      = $totalMailboxBytes
@@ -1667,13 +1698,28 @@ function Collect-ExchangeData {
                         AverageMailboxSizeBytes    = if ($mailboxCount -gt 0) { [math]::Round(($totalMailboxBytes / $mailboxCount), 0) } else { 0 }
                         AverageMailboxSizeGB       = if ($mailboxCount -gt 0) { [math]::Round((($totalMailboxBytes / $mailboxCount) / 1GB), 4) } else { 0 }
                         AverageItemCountPerMailbox = if ($mailboxCount -gt 0) { [math]::Round(($totalMailboxItems / $mailboxCount), 2) } else { 0 }
+                        DataSource                 = 'Microsoft Graph mailbox usage detail'
+                        ReportPeriod               = 'D30'
+                        ReportRefreshDate          = $reportRefreshDate
                         CollectDate                = (Get-Date -Format 'yyyy-MM-dd HH:mm')
                     })
-                Export-ToCsv -Data $mailboxSummary -FileName "EXO_MailboxUsageSummary_$date.csv"
-                Write-Log "  Mailboxes: $mailboxCount | Total size: $($mailboxSummary[0].TotalMailboxSizeGB) GB | Avg: $($mailboxSummary[0].AverageMailboxSizeGB) GB" 'SUCCESS'
+
+                    Export-ToCsv -Data $mailboxSummary -FileName "EXO_MailboxUsageSummary_$date.csv"
+                    Write-Log "  Mailboxes in Graph report: $mailboxCount | Total size: $($mailboxSummary[0].TotalMailboxSizeGB) GB | Avg: $($mailboxSummary[0].AverageMailboxSizeGB) GB" 'SUCCESS'
+                }
+                finally {
+                    if (Test-Path -LiteralPath $tempPath -PathType Leaf) {
+                        try {
+                            Remove-Item -LiteralPath $tempPath -Force -ErrorAction Stop
+                        }
+                        catch {
+                            Write-Log "  Temporary mailbox usage report was not removed; delete it manually: $tempPath" 'ERROR'
+                        }
+                    }
+                }
             }
             catch {
-                Write-Log "  Native mailbox usage detail unavailable: $($_.Exception.Message)" 'WARN'
+                Write-Log "  Graph mailbox usage detail unavailable: $($_.Exception.Message)" 'WARN'
                 $null = Invoke-GraphReportRequest `
                     -Uri "https://graph.microsoft.com/v1.0/reports/getMailboxUsageMailboxCounts(period='D30')" `
                     -FileName "EXO_MailboxUsageMailboxCounts_$date.csv"
@@ -2159,6 +2205,8 @@ function Collect-OneDriveData {
                 -DisableNameChecking -ErrorAction Stop
         }
         Connect-SPOService -Url $adminUrl -ErrorAction Stop
+        $script:spoConnected = $true
+        $script:spoAdminUrl = $adminUrl
         Write-Log "  Connected to SharePoint Online admin." 'SUCCESS'
 
         # --- OneDrive site summary (count + storage totals) ---
@@ -2211,7 +2259,11 @@ function Collect-OneDriveData {
         Write-Log "  OneDrive for Business connection failed: $($_.Exception.Message)" 'ERROR'
     }
     finally {
-        try { Disconnect-SPOService -ErrorAction SilentlyContinue } catch {}
+        if (-not $script:keepWorkloadSessions) {
+            try { Disconnect-SPOService -ErrorAction SilentlyContinue } catch {}
+            $script:spoConnected = $false
+            $script:spoAdminUrl = $null
+        }
     }
 
     Write-Log "  OneDrive for Business collection complete." 'SUCCESS'
@@ -3440,29 +3492,38 @@ function Collect-InformationBarriersData {
 
         # Step 5: SharePoint Online IB-related settings
         try {
-            # For Information Barriers, prefer WinPS compatibility session first in PS7.
-            # This isolates SPO from already-loaded EXO/Graph auth assemblies and avoids
-            # Microsoft.Identity.Client version binding conflicts in-process.
-            if ($PSVersionTable.PSVersion.Major -gt 5) {
-                try {
-                    Import-Module Microsoft.Online.SharePoint.PowerShell `
-                        -UseWindowsPowerShell -DisableNameChecking -ErrorAction Stop
-                }
-                catch {
-                    Write-Log "  SPO module load via UseWindowsPowerShell failed; retrying via SkipEditionCheck: $($_.Exception.Message)" 'DEBUG'
-                    Import-Module Microsoft.Online.SharePoint.PowerShell `
-                        -SkipEditionCheck -DisableNameChecking -ErrorAction Stop
-                }
+            $reuseSpoSession = $script:keepWorkloadSessions -and
+                $script:spoConnected -and
+                [string]::Equals($script:spoAdminUrl, $adminUrl, [System.StringComparison]::OrdinalIgnoreCase)
+            if ($reuseSpoSession) {
+                Write-Log "  Reusing the existing SharePoint Online admin session."
             }
             else {
-                Import-Module Microsoft.Online.SharePoint.PowerShell `
-                    -DisableNameChecking -ErrorAction Stop
-            }
+                # For Information Barriers, prefer WinPS compatibility in PS7 to
+                # isolate SPO from already-loaded EXO/Graph auth assemblies.
+                if ($PSVersionTable.PSVersion.Major -gt 5) {
+                    try {
+                        Import-Module Microsoft.Online.SharePoint.PowerShell `
+                            -UseWindowsPowerShell -DisableNameChecking -ErrorAction Stop
+                    }
+                    catch {
+                        Write-Log "  SPO module load via UseWindowsPowerShell failed; retrying via SkipEditionCheck: $($_.Exception.Message)" 'DEBUG'
+                        Import-Module Microsoft.Online.SharePoint.PowerShell `
+                            -SkipEditionCheck -DisableNameChecking -ErrorAction Stop
+                    }
+                }
+                else {
+                    Import-Module Microsoft.Online.SharePoint.PowerShell `
+                        -DisableNameChecking -ErrorAction Stop
+                }
 
-            Write-Log "  Connecting to SharePoint Online admin ($adminUrl)..."
-            Connect-SPOService -Url $adminUrl -ErrorAction Stop
-            $spoConnected = $true
-            Write-Log "  Connected to SharePoint Online admin." 'SUCCESS'
+                Write-Log "  Connecting to SharePoint Online admin ($adminUrl)..."
+                Connect-SPOService -Url $adminUrl -ErrorAction Stop
+                $spoConnected = $true
+                $script:spoConnected = $true
+                $script:spoAdminUrl = $adminUrl
+                Write-Log "  Connected to SharePoint Online admin." 'SUCCESS'
+            }
 
             try {
                 $spoTenant = Get-SPOTenant
@@ -3493,6 +3554,8 @@ function Collect-InformationBarriersData {
         }
         if ($spoConnected) {
             try { Disconnect-SPOService -ErrorAction SilentlyContinue } catch {}
+            $script:spoConnected = $false
+            $script:spoAdminUrl = $null
         }
     }
 
