@@ -4,7 +4,7 @@ An interactive PowerShell scanner for collecting Microsoft 365 configuration, us
 
 The scanner exports timestamped CSV files and a run log. It favors aggregate summaries and applies privacy filtering to exported rows. It does not remediate tenant settings or produce a compliance certification.
 
-**Script documented here:** `365-Assessment-Scanner.ps1`  
+**Script documented here:** `knowme-assessment-scanner.ps1`  
 **Author:** Mike Lee  
 **Script header version:** 4.0
 
