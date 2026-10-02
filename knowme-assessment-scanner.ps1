@@ -159,6 +159,8 @@ function Remove-PiiFromText {
 
     if ($null -eq $Value) { return '' }
     $text = [string]$Value
+    $text = $text -replace '(?i)\bhttps?://[^\s"''<>?]+\?(?:[^\s"''<>]*&)?sig=[^\s"''<>]*', '[REDACTED]'
+    $text = $text -replace '(?i)\bSharedAccessSignature=[^\s"'']+', 'SharedAccessSignature=[REDACTED]'
     $text = $text -replace '(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', '[REDACTED]'
     $text = $text -replace '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b', '[REDACTED]'
     $text = $text -replace '\b(?:\d{1,3}\.){3}\d{1,3}\b', '[REDACTED]'
